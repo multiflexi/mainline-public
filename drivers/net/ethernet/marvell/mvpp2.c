@@ -890,6 +890,9 @@ struct mvpp2 {
 	/* Workqueue to gather hardware statistics */
 	char queue_name[30];
 	struct workqueue_struct *stats_queue;
+
+	/* Hack for the DMA mask */
+	bool custom_dma_mask;
 };
 
 struct mvpp2_pcpu_stats {
@@ -8369,10 +8372,28 @@ static int mvpp2_probe(struct platform_device *pdev)
 	/* Get system's tclk rate */
 	priv->tclk = clk_get_rate(priv->pp_clk);
 
+	priv->custom_dma_mask = false;
 	if (priv->hw_version == MVPP22) {
+		/* If dma_mask points to coherent_dma_mask, setting both will
+		 * override the value of the other. This is problematic as the
+		 * PPv2 driver uses a 32-bit-mask for coherent accesses (txq,
+		 * rxq, bm) and a 40-bit mask for all other accesses.
+		 */
+		if (pdev->dev.dma_mask == &pdev->dev.coherent_dma_mask) {
+			pdev->dev.dma_mask = kzalloc(sizeof(*pdev->dev.dma_mask),
+						     GFP_KERNEL);
+			if (!pdev->dev.dma_mask) {
+				err = -ENOMEM;
+				goto err_mg_clk;
+			}
+
+			priv->custom_dma_mask = true;
+		}
+
 		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(40));
 		if (err)
-			goto err_mg_clk;
+			goto err_dma_mask;
+
 		/* Sadly, the BM pools all share the same register to
 		 * store the high 32 bits of their address. So they
 		 * must all have the same high 32 bits, which forces
@@ -8380,21 +8401,21 @@ static int mvpp2_probe(struct platform_device *pdev)
 		 */
 		err = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
 		if (err)
-			goto err_mg_clk;
+			goto err_dma_mask;
 	}
 
 	/* Initialize network controller */
 	err = mvpp2_init(pdev, priv);
 	if (err < 0) {
 		dev_err(&pdev->dev, "failed to initialize controller\n");
-		goto err_mg_clk;
+		goto err_dma_mask;
 	}
 
 	priv->port_count = of_get_available_child_count(dn);
 	if (priv->port_count == 0) {
 		dev_err(&pdev->dev, "no ports enabled\n");
 		err = -ENODEV;
-		goto err_mg_clk;
+		goto err_dma_mask;
 	}
 
 	priv->port_list = devm_kcalloc(&pdev->dev, priv->port_count,
@@ -8402,7 +8423,7 @@ static int mvpp2_probe(struct platform_device *pdev)
 				       GFP_KERNEL);
 	if (!priv->port_list) {
 		err = -ENOMEM;
-		goto err_mg_clk;
+		goto err_dma_mask;
 	}
 
 	/* Initialize ports */
@@ -8439,6 +8460,9 @@ err_port_probe:
 			mvpp2_port_remove(priv->port_list[i]);
 		i++;
 	}
+err_dma_mask:
+	if (priv->custom_dma_mask)
+		kfree(pdev->dev.dma_mask);
 err_mg_clk:
 	clk_disable_unprepare(priv->axi_clk);
 	if (priv->hw_version == MVPP22)
@@ -8482,6 +8506,9 @@ static int mvpp2_remove(struct platform_device *pdev)
 				  aggr_txq->descs,
 				  aggr_txq->descs_dma);
 	}
+
+	if (priv->custom_dma_mask)
+		kfree(pdev->dev.dma_mask);
 
 	clk_disable_unprepare(priv->axi_clk);
 	clk_disable_unprepare(priv->mg_clk);
