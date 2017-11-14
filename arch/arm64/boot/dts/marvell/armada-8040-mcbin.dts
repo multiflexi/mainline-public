@@ -66,6 +66,7 @@
 		ethernet0 = &cpm_eth0;
 		ethernet1 = &cps_eth0;
 		ethernet2 = &cps_eth1;
+		ethernet3 = &cps_eth2;
 	};
 
 	/* Regulator labels correspond with schematics */
@@ -283,6 +284,14 @@
 	phy-mode = "sgmii";
 	/* Generic PHY, providing serdes lanes */
 	phys = <&cps_comphy0 1>;
+};
+
+&cps_eth2 {
+	/* CPS Lane 5 */
+	status = "okay";
+	phy-mode = "2500base-x";
+	/* Generic PHY, providing serdes lanes */
+	phys = <&cps_comphy5 2>;
 };
 
 &cps_pinctrl {
