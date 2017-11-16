@@ -5735,6 +5735,8 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
 	u32 val;
 	int cpu, desc, desc_per_txq, tx_port_num;
 	struct mvpp2_txq_pcpu *txq_pcpu;
+	struct net_device *dev = port->dev;
+	bool tso = dev->features & NETIF_F_TSO;
 
 	txq->size = port->tx_ring_size;
 
@@ -5807,13 +5809,41 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
 		txq_pcpu->stop_threshold = txq->size - MVPP2_MAX_SKB_DESCS;
 		txq_pcpu->wake_threshold = txq_pcpu->stop_threshold / 2;
 
+		if (!tso)
+			continue;
+
 		txq_pcpu->tso_headers =
 			dma_alloc_coherent(port->dev->dev.parent,
 					   txq_pcpu->size * TSO_HEADER_SIZE,
 					   &txq_pcpu->tso_headers_dma,
 					   GFP_KERNEL);
 		if (!txq_pcpu->tso_headers)
-			return -ENOMEM;
+			tso = false;
+	}
+
+	/* TSO was enabled but not enough memory is available to allocate the
+	 * TSO specific buffers. Free the successfully allocated buffers, warn
+	 * the user and disable TSO.
+	 */
+	if ((dev->features & NETIF_F_TSO) && !tso)
+		goto cleanup_tso;
+
+	return 0;
+
+cleanup_tso:
+	dev->features &= ~NETIF_F_TSO;
+	netdev_warn(dev, "TSO disabled\n");
+
+	for_each_present_cpu(cpu) {
+		txq_pcpu = per_cpu_ptr(txq->pcpu, cpu);
+
+		if (txq_pcpu->tso_headers)
+			dma_free_coherent(port->dev->dev.parent,
+					  txq_pcpu->size * TSO_HEADER_SIZE,
+					  txq_pcpu->tso_headers,
+					  txq_pcpu->tso_headers_dma);
+
+		txq_pcpu->tso_headers = NULL;
 	}
 
 	return 0;
