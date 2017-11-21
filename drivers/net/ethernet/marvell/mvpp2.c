@@ -505,7 +505,7 @@
  * skb. As we need a maxium of two descriptors per fragments (1 header, 1 data),
  * multiply this value by two to count the maximum number of skb descs needed.
  */
-#define MVPP2_MAX_TSO_SEGS		300
+#define MVPP2_MAX_TSO_SEGS		100
 #define MVPP2_MAX_SKB_DESCS		(MVPP2_MAX_TSO_SEGS * 2 + MAX_SKB_FRAGS)
 
 /* Dfault number of RXQs in use */
@@ -6155,7 +6155,8 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
 		txq_pcpu->tso_headers = NULL;
 
 		txq_pcpu->stop_threshold = txq->size - MVPP2_MAX_SKB_DESCS;
-		txq_pcpu->wake_threshold = txq_pcpu->stop_threshold / 2;
+		txq_pcpu->wake_threshold =
+			txq_pcpu->stop_threshold - MVPP2_MAX_TSO_SEGS;
 
 		txq_pcpu->tso_headers =
 			dma_alloc_coherent(port->dev->dev.parent,
