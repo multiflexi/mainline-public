@@ -30,8 +30,11 @@
 #define PCIE_CORE_DEV_CTRL_STATS_REG				0xc8
 #define     PCIE_CORE_DEV_CTRL_STATS_RELAX_ORDER_DISABLE	(0 << 4)
 #define     PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ_SHIFT	5
+#define     PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ		0x2
 #define     PCIE_CORE_DEV_CTRL_STATS_SNOOP_DISABLE		(0 << 11)
 #define     PCIE_CORE_DEV_CTRL_STATS_MAX_RD_REQ_SIZE_SHIFT	12
+#define     PCIE_CORE_DEV_CTRL_STATS_MAX_RD_REQ_SZ		0x2
+#define     PCIE_CORE_MPS_UNIT_BYTE				128
 #define PCIE_CORE_LINK_CTRL_STAT_REG				0xd0
 #define     PCIE_CORE_LINK_L0S_ENTRY				BIT(0)
 #define     PCIE_CORE_LINK_TRAINING				BIT(5)
@@ -103,7 +106,8 @@
 #define PCIE_ISR1_MASK_REG			(CONTROL_BASE_ADDR + 0x4C)
 #define     PCIE_ISR1_POWER_STATE_CHANGE	BIT(4)
 #define     PCIE_ISR1_FLUSH			BIT(5)
-#define     PCIE_ISR1_ALL_MASK			GENMASK(5, 4)
+#define     PCIE_ISR1_INTX_ASSERT(val)		BIT(8 + (val))
+#define     PCIE_ISR1_ALL_MASK			GENMASK(11, 4)
 #define PCIE_MSI_ADDR_LOW_REG			(CONTROL_BASE_ADDR + 0x50)
 #define PCIE_MSI_ADDR_HIGH_REG			(CONTROL_BASE_ADDR + 0x54)
 #define PCIE_MSI_STATUS_REG			(CONTROL_BASE_ADDR + 0x58)
@@ -297,9 +301,11 @@ static void advk_pcie_setup_hw(struct advk_pcie *pcie)
 
 	/* Set PCIe Device Control and Status 1 PF0 register */
 	reg = PCIE_CORE_DEV_CTRL_STATS_RELAX_ORDER_DISABLE |
-		(7 << PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ_SHIFT) |
+		(PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ <<
+		 PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ_SHIFT) |
 		PCIE_CORE_DEV_CTRL_STATS_SNOOP_DISABLE |
-		PCIE_CORE_DEV_CTRL_STATS_MAX_RD_REQ_SIZE_SHIFT;
+		(PCIE_CORE_DEV_CTRL_STATS_MAX_RD_REQ_SZ <<
+		 PCIE_CORE_DEV_CTRL_STATS_MAX_RD_REQ_SIZE_SHIFT);
 	advk_writel(pcie, reg, PCIE_CORE_DEV_CTRL_STATS_REG);
 
 	/* Program PCIe Control 2 to disable strict ordering */
@@ -364,8 +370,7 @@ static void advk_pcie_setup_hw(struct advk_pcie *pcie)
 
 	advk_pcie_wait_for_link(pcie);
 
-	reg = PCIE_CORE_LINK_L0S_ENTRY |
-		(1 << PCIE_CORE_LINK_WIDTH_SHIFT);
+	reg = (1 << PCIE_CORE_LINK_WIDTH_SHIFT);
 	advk_writel(pcie, reg, PCIE_CORE_LINK_CTRL_STAT_REG);
 
 	reg = advk_readl(pcie, PCIE_CORE_CMD_STATUS_REG);
@@ -440,7 +445,7 @@ static int advk_pcie_rd_conf(struct pci_bus *bus, u32 devfn,
 	u32 reg;
 	int ret;
 
-	if (PCI_SLOT(devfn) != 0) {
+	if ((bus->number == pcie->root_bus_nr) && (PCI_SLOT(devfn) != 0)) {
 		*val = 0xffffffff;
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
@@ -459,7 +464,7 @@ static int advk_pcie_rd_conf(struct pci_bus *bus, u32 devfn,
 	advk_writel(pcie, reg, PIO_CTRL);
 
 	/* Program the address registers */
-	reg = PCIE_BDF(devfn) | PCIE_CONF_REG(where);
+	reg = PCIE_CONF_ADDR(bus->number, devfn, where);
 	advk_writel(pcie, reg, PIO_ADDR_LS);
 	advk_writel(pcie, 0, PIO_ADDR_MS);
 
@@ -494,7 +499,7 @@ static int advk_pcie_wr_conf(struct pci_bus *bus, u32 devfn,
 	int offset;
 	int ret;
 
-	if (PCI_SLOT(devfn) != 0)
+	if ((bus->number == pcie->root_bus_nr) && (PCI_SLOT(devfn) != 0))
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
 	if (where % size)
@@ -612,9 +617,9 @@ static void advk_pcie_irq_mask(struct irq_data *d)
 	irq_hw_number_t hwirq = irqd_to_hwirq(d);
 	u32 mask;
 
-	mask = advk_readl(pcie, PCIE_ISR0_MASK_REG);
-	mask |= PCIE_ISR0_INTX_ASSERT(hwirq);
-	advk_writel(pcie, mask, PCIE_ISR0_MASK_REG);
+	mask = advk_readl(pcie, PCIE_ISR1_MASK_REG);
+	mask |= PCIE_ISR1_INTX_ASSERT(hwirq);
+	advk_writel(pcie, mask, PCIE_ISR1_MASK_REG);
 }
 
 static void advk_pcie_irq_unmask(struct irq_data *d)
@@ -623,9 +628,9 @@ static void advk_pcie_irq_unmask(struct irq_data *d)
 	irq_hw_number_t hwirq = irqd_to_hwirq(d);
 	u32 mask;
 
-	mask = advk_readl(pcie, PCIE_ISR0_MASK_REG);
-	mask &= ~PCIE_ISR0_INTX_ASSERT(hwirq);
-	advk_writel(pcie, mask, PCIE_ISR0_MASK_REG);
+	mask = advk_readl(pcie, PCIE_ISR1_MASK_REG);
+	mask &= ~PCIE_ISR1_INTX_ASSERT(hwirq);
+	advk_writel(pcie, mask, PCIE_ISR1_MASK_REG);
 }
 
 static int advk_pcie_irq_map(struct irq_domain *h,
@@ -768,29 +773,35 @@ static void advk_pcie_handle_msi(struct advk_pcie *pcie)
 
 static void advk_pcie_handle_int(struct advk_pcie *pcie)
 {
-	u32 val, mask, status;
+	u32 isr0_val, isr0_mask, isr0_status;
+	u32 isr1_val, isr1_mask, isr1_status;
 	int i, virq;
 
-	val = advk_readl(pcie, PCIE_ISR0_REG);
-	mask = advk_readl(pcie, PCIE_ISR0_MASK_REG);
-	status = val & ((~mask) & PCIE_ISR0_ALL_MASK);
+	isr0_val = advk_readl(pcie, PCIE_ISR0_REG);
+	isr0_mask = advk_readl(pcie, PCIE_ISR0_MASK_REG);
+	isr0_status = isr0_val & ((~isr0_mask) & PCIE_ISR0_ALL_MASK);
 
-	if (!status) {
-		advk_writel(pcie, val, PCIE_ISR0_REG);
+	isr1_val = advk_readl(pcie, PCIE_ISR1_REG);
+	isr1_mask = advk_readl(pcie, PCIE_ISR1_MASK_REG);
+	isr1_status = isr1_val & ((~isr1_mask) & PCIE_ISR1_ALL_MASK);
+
+	if (!isr0_status && !isr1_status) {
+		advk_writel(pcie, isr0_val, PCIE_ISR0_REG);
+		advk_writel(pcie, isr1_val, PCIE_ISR1_REG);
 		return;
 	}
 
 	/* Process MSI interrupts */
-	if (status & PCIE_ISR0_MSI_INT_PENDING)
+	if (isr0_status & PCIE_ISR0_MSI_INT_PENDING)
 		advk_pcie_handle_msi(pcie);
 
 	/* Process legacy interrupts */
 	for (i = 0; i < PCI_NUM_INTX; i++) {
-		if (!(status & PCIE_ISR0_INTX_ASSERT(i)))
+		if (!(isr1_status & PCIE_ISR1_INTX_ASSERT(i)))
 			continue;
 
-		advk_writel(pcie, PCIE_ISR0_INTX_ASSERT(i),
-			    PCIE_ISR0_REG);
+		advk_writel(pcie, PCIE_ISR1_INTX_ASSERT(i),
+			    PCIE_ISR1_REG);
 
 		virq = irq_find_mapping(pcie->irq_domain, i);
 		generic_handle_irq(virq);
@@ -879,6 +890,58 @@ out_release_res:
 	return err;
 }
 
+static int advk_pcie_find_smpss(struct pci_dev *dev, void *data)
+{
+	u8 *smpss = data;
+
+	if (!dev)
+		return 0;
+
+	if (!pci_is_pcie(dev))
+		return 0;
+
+	if (*smpss > dev->pcie_mpss)
+		*smpss = dev->pcie_mpss;
+
+	return 0;
+}
+
+static int advk_pcie_bus_configure_mps(struct pci_dev *dev, void *data)
+{
+	int mps;
+
+	if (!dev)
+		return 0;
+
+	if (!pci_is_pcie(dev))
+		return 0;
+
+	mps = PCIE_CORE_MPS_UNIT_BYTE << *(u8 *)data;
+	pcie_set_mps(dev, mps);
+
+	return 0;
+}
+
+static void advk_pcie_configure_mps(struct pci_bus *bus, struct advk_pcie *pcie)
+{
+	u8 smpss = PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ;
+	u32 reg;
+
+	/* Find the minimal supported MAX payload size */
+	advk_pcie_find_smpss(bus->self, &smpss);
+	pci_walk_bus(bus, advk_pcie_find_smpss, &smpss);
+
+	/* Configure RC MAX payload size */
+	reg = advk_readl(pcie, PCIE_CORE_DEV_CTRL_STATS_REG);
+	reg &= ~PCI_EXP_DEVCTL_PAYLOAD;
+	reg |= smpss << PCIE_CORE_DEV_CTRL_STATS_MAX_PAYLOAD_SZ_SHIFT;
+	advk_writel(pcie, reg, PCIE_CORE_DEV_CTRL_STATS_REG);
+
+	/* Configure device MAX payload size */
+	advk_pcie_bus_configure_mps(bus->self, &smpss);
+	pci_walk_bus(bus, advk_pcie_bus_configure_mps, &smpss);
+}
+
 static int advk_pcie_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -951,6 +1014,9 @@ static int advk_pcie_probe(struct platform_device *pdev)
 
 	list_for_each_entry(child, &bus->children, node)
 		pcie_bus_configure_settings(child);
+
+	/* Configure the MAX pay load size */
+	advk_pcie_configure_mps(bus, pcie);
 
 	pci_bus_add_devices(bus);
 	return 0;
