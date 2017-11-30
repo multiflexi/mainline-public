@@ -777,6 +777,34 @@ enum mvpp2_prs_l3_cast {
 #define MVPP2_CLS_LKP_TBL_SIZE		64
 #define MVPP2_CLS_RX_QUEUES		256
 
+/* Classifier lkp entries */
+#define MVPP22_CLS_LKP_FLOW_ID(x)	((x) << 16)
+#define MVPP22_CLS_LKP_FLOW_ID_MASK	GENMASK(24, 16)
+enum {
+	MVPP22_CLS_FLOW_DEFAULT = 0,
+	MVPP22_CLS_FLOW_RSS_2T,
+	MVPP22_CLS_FLOW_RSS_5T,
+};
+#define MVPP22_CLS_LKP_EN		BIT(25)
+
+/* Classifier fow entries */
+#define MVPP22_CLS_FLOW_LAST		BIT(0)
+#define MVPP22_CLS_FLOW_ENGINE(x)	((x) << 1)
+enum {
+	MVPP22_CLS_ENGINE_C2	= 1,
+	MVPP22_CLS_ENGINE_C3A,
+	MVPP22_CLS_ENGINE_C3B,
+	MVPP22_CLS_ENGINE_C4,
+	MVPP22_CLS_ENGINE_C3HA	= 6,
+	MVPP22_CLS_ENGINE_C3HB	= 7,
+};
+#define MVPP22_CLS_FLOW_PORT_ID(x)	((x) << 4)
+#define MVPP22_CLS_FLOW_PORT_ID_SEL	BIT(23)
+
+#define MVPP22_CLS_FLOW_N_FIELDS(x)	(x)
+
+#define MVPP22_CLS_FLOW_FIELD(n, x)	((x) << ((n) * 6))
+
 /* RSS constants */
 #define MVPP22_RSS_TABLE_ENTRIES	32
 
@@ -908,6 +936,9 @@ struct mvpp2 {
 
 	/* Hack for the DMA mask */
 	bool custom_dma_mask;
+
+	/* RSS hash mode for UDP */
+	enum { MVPP22_RSS_UDP_2T, MVPP22_RSS_UDP_5T } rss_hash;
 };
 
 struct mvpp2_pcpu_stats {
@@ -3791,15 +3822,55 @@ static void mvpp2_cls_flow_write(struct mvpp2 *priv,
 	mvpp2_write(priv, MVPP2_CLS_FLOW_TBL2_REG,  fe->data[2]);
 }
 
+static void mvpp2_cls_flow_read(struct mvpp2 *priv,
+				struct mvpp2_cls_flow_entry *fe, u32 index)
+{
+	mvpp2_write(priv, MVPP2_CLS_FLOW_INDEX_REG, index);
+
+	fe->index = index;
+	fe->data[0] = mvpp2_read(priv, MVPP2_CLS_FLOW_TBL0_REG);
+	fe->data[1] = mvpp2_read(priv, MVPP2_CLS_FLOW_TBL1_REG);
+	fe->data[2] = mvpp2_read(priv, MVPP2_CLS_FLOW_TBL2_REG);
+}
+
 /* Update classification lookup table register */
 static void mvpp2_cls_lookup_write(struct mvpp2 *priv,
 				   struct mvpp2_cls_lookup_entry *le)
 {
-	u32 val;
-
-	val = (le->way << MVPP2_CLS_LKP_INDEX_WAY_OFFS) | le->lkpid;
+	u32 val = (le->way << MVPP2_CLS_LKP_INDEX_WAY_OFFS) | le->lkpid;
 	mvpp2_write(priv, MVPP2_CLS_LKP_INDEX_REG, val);
 	mvpp2_write(priv, MVPP2_CLS_LKP_TBL_REG, le->data);
+}
+
+static void mvpp2_cls_lookup_read(struct mvpp2 *priv,
+				  struct mvpp2_cls_lookup_entry *le, u32 lkpid,
+				  u32 way)
+{
+	u32 val = (way << MVPP2_CLS_LKP_INDEX_WAY_OFFS) | lkpid;
+	mvpp2_write(priv, MVPP2_CLS_LKP_INDEX_REG, val);
+
+	le->lkpid = lkpid;
+	le->way = way;
+	le->data = mvpp2_read(priv, MVPP2_CLS_LKP_TBL_REG);
+}
+
+static void mvpp2_cls_update(struct mvpp2 *priv)
+{
+	struct mvpp2_cls_lookup_entry le;
+	u32 flow, index, way;
+
+	flow = (priv->rss_hash == MVPP22_RSS_UDP_5T) ?
+	       MVPP22_CLS_FLOW_RSS_5T : MVPP22_CLS_FLOW_RSS_2T;
+
+	/* Update the classifier flow table */
+	for (index = 0; index < MVPP2_CLS_LKP_TBL_SIZE; index++) {
+		for (way = 0; way < 2; way++) {
+			mvpp2_cls_lookup_read(priv, &le, index, way);
+			le.data &= ~MVPP22_CLS_LKP_FLOW_ID_MASK;
+			le.data |= MVPP22_CLS_LKP_FLOW_ID(flow);
+			mvpp2_cls_lookup_write(priv, &le);
+		}
+	}
 }
 
 /* Classifier default initialization */
@@ -3808,19 +3879,12 @@ static void mvpp2_cls_init(struct mvpp2 *priv)
 	struct mvpp2_cls_lookup_entry le;
 	struct mvpp2_cls_flow_entry fe;
 	int index;
-
-	/* Enable classifier */
-	mvpp2_write(priv, MVPP2_CLS_MODE_REG, MVPP2_CLS_MODE_ACTIVE_MASK);
-
-	/* Clear classifier flow table */
-	memset(&fe.data, 0, sizeof(fe.data));
-	for (index = 0; index < MVPP2_CLS_FLOWS_TBL_SIZE; index++) {
-		fe.index = index;
-		mvpp2_cls_flow_write(priv, &fe);
-	}
+	u32 flow;
 
 	/* Clear classifier lookup table */
-	le.data = 0;
+	flow = (priv->rss_hash == MVPP22_RSS_UDP_5T) ?
+	       MVPP22_CLS_FLOW_RSS_5T : MVPP22_CLS_FLOW_RSS_2T;
+	le.data = MVPP22_CLS_LKP_FLOW_ID(flow) | MVPP22_CLS_LKP_EN;
 	for (index = 0; index < MVPP2_CLS_LKP_TBL_SIZE; index++) {
 		le.lkpid = index;
 		le.way = 0;
@@ -3829,10 +3893,45 @@ static void mvpp2_cls_init(struct mvpp2 *priv)
 		le.way = 1;
 		mvpp2_cls_lookup_write(priv, &le);
 	}
+
+	/* Clear classifier flow table */
+	memset(&fe.data, 0, sizeof(fe.data));
+	for (index = 0; index < MVPP2_CLS_FLOWS_TBL_SIZE; index++) {
+		fe.index = index;
+		mvpp2_cls_flow_write(priv, &fe);
+	}
+
+	/* Default flow */
+	fe.index = MVPP22_CLS_FLOW_DEFAULT;
+	mvpp2_cls_flow_write(priv, &fe);
+
+	/* RSS specific flows: UDP 2T */
+	fe.index = MVPP22_CLS_FLOW_RSS_2T;
+	fe.data[0] = MVPP22_CLS_FLOW_ENGINE(MVPP22_CLS_ENGINE_C3HA) |
+		     MVPP22_CLS_FLOW_LAST | MVPP22_CLS_FLOW_PORT_ID(0xff);
+	fe.data[1] = MVPP22_CLS_FLOW_N_FIELDS(2);
+	fe.data[2] = MVPP22_CLS_FLOW_FIELD(0, 0x10) |
+		     MVPP22_CLS_FLOW_FIELD(1, 0x11);
+	mvpp2_cls_flow_write(priv, &fe);
+
+	/* RSS specific flows: UDP 5T */
+	fe.index = MVPP22_CLS_FLOW_RSS_5T;
+	fe.data[0] = MVPP22_CLS_FLOW_ENGINE(MVPP22_CLS_ENGINE_C3HB) |
+		     MVPP22_CLS_FLOW_LAST | MVPP22_CLS_FLOW_PORT_ID(0xff);
+	fe.data[1] = MVPP22_CLS_FLOW_N_FIELDS(4);
+	fe.data[2] = MVPP22_CLS_FLOW_FIELD(0, 0x10) |
+		     MVPP22_CLS_FLOW_FIELD(1, 0x11) |
+		     MVPP22_CLS_FLOW_FIELD(2, 0x1d) |
+		     MVPP22_CLS_FLOW_FIELD(3, 0x1e);
+	mvpp2_cls_flow_write(priv, &fe);
+
+	/* Enable classifier */
+	mvpp2_write(priv, MVPP2_CLS_MODE_REG, MVPP2_CLS_MODE_ACTIVE_MASK);
 }
 
 static void mvpp2_cls_port_config(struct mvpp2_port *port)
 {
+	struct mvpp2 *priv = port->priv;
 	struct mvpp2_cls_lookup_entry le;
 	u32 val;
 
@@ -3844,16 +3943,11 @@ static void mvpp2_cls_port_config(struct mvpp2_port *port)
 	/* Pick the entry to be accessed in lookup ID decoding table
 	 * according to the way and lkpid.
 	 */
-	le.lkpid = port->id;
-	le.way = 0;
-	le.data = 0;
+	mvpp2_cls_lookup_read(priv, &le, port->id, 0);
 
 	/* Set initial CPU queue for receiving packets */
 	le.data &= ~MVPP2_CLS_LKP_TBL_RXQ_MASK;
 	le.data |= port->first_rxq;
-
-	/* Disable classification engines */
-	le.data &= ~MVPP2_CLS_LKP_TBL_LOOKUP_EN_MASK;
 
 	/* Update lookup ID table entry */
 	mvpp2_cls_lookup_write(port->priv, &le);
@@ -7507,11 +7601,74 @@ static int mvpp2_ethtool_set_link_ksettings(struct net_device *dev,
 	return phylink_ethtool_ksettings_set(port->phylink, cmd);
 }
 
+static int mvpp22_get_rss_hash_opts(struct mvpp2_port *port,
+				    struct ethtool_rxnfc *info)
+{
+	struct mvpp2 *priv = port->priv;
+
+	switch (info->cmd) {
+	case IPV4_FLOW:
+	case IPV6_FLOW:
+		info->data = RXH_IP_SRC | RXH_IP_DST;
+		break;
+	case TCP_V4_FLOW:
+	case TCP_V6_FLOW:
+		info->data = RXH_IP_SRC | RXH_IP_DST | RXH_L4_B_0_1 |
+			     RXH_L4_B_2_3;
+		break;
+	case UDP_V4_FLOW:
+	case UDP_V6_FLOW:
+		info->data = RXH_IP_SRC | RXH_IP_DST;
+		if (priv->rss_hash == MVPP22_RSS_UDP_5T)
+			info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
+	default:
+		return -ENOTSUPP;
+	}
+
+	return 0;
+}
+
+static int mvpp22_set_rss_hash_opts(struct mvpp2_port *port,
+				    struct ethtool_rxnfc *info)
+{
+	struct mvpp2 *priv = port->priv;
+	u32 mask;
+
+	switch (info->flow_type) {
+	case IPV4_FLOW:
+	case IPV6_FLOW:
+		mask = RXH_IP_SRC | RXH_IP_DST;
+		if ((info->data & mask) != mask)
+			return -ENOTSUPP;
+		break;
+	case TCP_V4_FLOW:
+	case TCP_V6_FLOW:
+		mask = RXH_IP_SRC | RXH_IP_DST | RXH_L4_B_0_1 | RXH_L4_B_2_3;
+		if ((info->data & mask) != mask)
+			return -ENOTSUPP;
+		break;
+	case UDP_V4_FLOW:
+	case UDP_V6_FLOW:
+		if (info->data & (RXH_L4_B_0_1 | RXH_L4_B_2_3))
+			priv->rss_hash = MVPP22_RSS_UDP_5T;
+		else
+			priv->rss_hash = MVPP22_RSS_UDP_2T;
+
+		mvpp2_cls_update(priv);
+		break;
+	default:
+		return -ENOTSUPP;
+	}
+
+	return 0;
+}
+
 static int mvpp2_ethtool_get_rxnfc(struct net_device *dev,
 				   struct ethtool_rxnfc *info, u32 *rules)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
 	struct mvpp2 *priv = port->priv;
+	int ret = 0;
 
 	if (priv->hw_version != MVPP22)
 		return -EOPNOTSUPP;
@@ -7520,11 +7677,35 @@ static int mvpp2_ethtool_get_rxnfc(struct net_device *dev,
 	case ETHTOOL_GRXRINGS:
 		info->data = port->nrxqs;
 		break;
+	case ETHTOOL_GRXFH:
+		ret = mvpp22_get_rss_hash_opts(port, info);
+		break;
 	default:
 		return -ENOTSUPP;
 	}
 
-	return 0;
+	return ret;
+}
+
+static int mvpp2_ethtool_set_rxnfc(struct net_device *dev,
+				   struct ethtool_rxnfc *info)
+{
+	struct mvpp2_port *port = netdev_priv(dev);
+	struct mvpp2 *priv = port->priv;
+	int ret = 0;
+
+	if (priv->hw_version != MVPP22)
+		return -EOPNOTSUPP;
+
+	switch (info->cmd) {
+	case ETHTOOL_SRXFH:
+		ret = mvpp22_set_rss_hash_opts(port, info);
+		break;
+	default:
+		return -ENOTSUPP;
+	}
+
+	return ret;
 }
 
 static u32 mvpp2_ethtool_get_rxfh_indir_size(struct net_device *dev)
@@ -7607,6 +7788,7 @@ static const struct ethtool_ops mvpp2_eth_tool_ops = {
 	.get_link_ksettings	= mvpp2_ethtool_get_link_ksettings,
 	.set_link_ksettings	= mvpp2_ethtool_set_link_ksettings,
 	.get_rxnfc		= mvpp2_ethtool_get_rxnfc,
+	.set_rxnfc		= mvpp2_ethtool_set_rxnfc,
 	.get_rxfh_indir_size	= mvpp2_ethtool_get_rxfh_indir_size,
 	.get_rxfh		= mvpp2_ethtool_get_rxfh,
 	.set_rxfh		= mvpp2_ethtool_set_rxfh,
@@ -8597,6 +8779,9 @@ static int mvpp2_probe(struct platform_device *pdev)
 		priv->iface_base = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(priv->iface_base))
 			return PTR_ERR(priv->iface_base);
+
+		/* Default RSS hash mode for UDP */
+		priv->rss_hash = MVPP22_RSS_UDP_2T;
 
 		priv->sysctrl_base =
 			syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
