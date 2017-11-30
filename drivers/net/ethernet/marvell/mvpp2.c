@@ -8908,7 +8908,7 @@ static int mvpp2_probe(struct platform_device *pdev)
 	}
 
 	/* Default RSS hash mode for UDP */
-	priv->rss_hash = MVPP22_RSS_UDP_2T;
+	priv->rss_hash = MVPP22_RSS_UDP_5T;
 
 	if (priv->hw_version == MVPP22 && dev_of_node(&pdev->dev)) {
 		priv->sysctrl_base =
