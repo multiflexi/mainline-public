@@ -141,7 +141,7 @@
 
 /* EIP197_HIA_xDR_DMA_CFG */
 #define EIP197_HIA_xDR_WR_RES_BUF		BIT(22)
-#define EIP197_HIA_xDR_WR_CTRL_BUG		BIT(23)
+#define EIP197_HIA_xDR_WR_CTRL_BUF		BIT(23)
 #define EIP197_HIA_xDR_WR_OWN_BUF		BIT(24)
 #define EIP197_HIA_xDR_CFG_xD_PROT(n)		(((n) & 0xf) << 4)
 #define EIP197_HIA_xDR_CFG_DATA_PROT(n)		(((n) & 0xf) << 12)
