@@ -27,6 +27,7 @@
 #include <linux/of_net.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/phy.h>
 #include <linux/phy/phy.h>
 #include <linux/clk.h>
@@ -8462,18 +8463,23 @@ static int mvpp2_probe(struct platform_device *pdev)
 			goto err_mg_clk;
 	}
 
+	/* Assign the reserved memory region to the device for DMA allocations,
+	 * if a memory-region phandle is found.
+	 */
+	of_reserved_mem_device_init_by_idx(&pdev->dev, pdev->dev.of_node, 0);
+
 	/* Initialize network controller */
 	err = mvpp2_init(pdev, priv);
 	if (err < 0) {
 		dev_err(&pdev->dev, "failed to initialize controller\n");
-		goto err_mg_clk;
+		goto err_mem_device;
 	}
 
 	priv->port_count = of_get_available_child_count(dn);
 	if (priv->port_count == 0) {
 		dev_err(&pdev->dev, "no ports enabled\n");
 		err = -ENODEV;
-		goto err_mg_clk;
+		goto err_mem_device;
 	}
 
 	priv->port_list = devm_kcalloc(&pdev->dev, priv->port_count,
@@ -8481,7 +8487,7 @@ static int mvpp2_probe(struct platform_device *pdev)
 				       GFP_KERNEL);
 	if (!priv->port_list) {
 		err = -ENOMEM;
-		goto err_mg_clk;
+		goto err_mem_device;
 	}
 
 	/* Initialize ports */
@@ -8518,6 +8524,8 @@ err_port_probe:
 			mvpp2_port_remove(priv->port_list[i]);
 		i++;
 	}
+err_mem_device:
+	of_reserved_mem_device_release(&pdev->dev);
 err_mg_clk:
 	clk_disable_unprepare(priv->axi_clk);
 	if (priv->hw_version == MVPP22)
