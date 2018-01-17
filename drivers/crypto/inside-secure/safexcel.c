@@ -496,6 +496,9 @@ handle_req:
 		if (backlog)
 			backlog->complete(backlog, -EINPROGRESS);
 
+		if (!commands && !results)
+			continue;
+
 		spin_lock_bh(&priv->ring[ring].egress_lock);
 		list_add_tail(&request->list, &priv->ring[ring].list);
 		spin_unlock_bh(&priv->ring[ring].egress_lock);
