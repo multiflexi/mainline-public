@@ -361,6 +361,9 @@ static int safexcel_hw_init(struct safexcel_crypto_priv *priv)
 	val |= EIP197_ALG_AES_ECB | EIP197_ALG_AES_CBC;
 	val |= EIP197_ALG_SHA1 | EIP197_ALG_HMAC_SHA1;
 	val |= EIP197_ALG_SHA2;
+	val |= EIP197_ALG_DES_ECB | EIP197_ALG_DES_CBC;
+	val |= EIP197_ALG_3DES_ECB | EIP197_ALG_3DES_CBC;
+	
 	writel(val, EIP197_PE(priv) + EIP197_PE_EIP96_FUNCTION_EN);
 
 	/* Command Descriptor Rings prepare */
@@ -785,6 +788,10 @@ static int safexcel_request_ring_irq(struct platform_device *pdev, const char *n
 static struct safexcel_alg_template *safexcel_algs[] = {
 	&safexcel_alg_ecb_aes,
 	&safexcel_alg_cbc_aes,
+	&safexcel_alg_cbc_des,
+	&safexcel_alg_cbc_des3_ede,
+	&safexcel_alg_ecb_des,
+	&safexcel_alg_ecb_des3_ede,
 	&safexcel_alg_sha1,
 	&safexcel_alg_sha224,
 	&safexcel_alg_sha256,

@@ -13,6 +13,7 @@
 #include <linux/dmapool.h>
 
 #include <crypto/aes.h>
+#include <crypto/des.h>
 #include <crypto/skcipher.h>
 #include <crypto/internal/skcipher.h>
 
@@ -23,11 +24,18 @@ enum safexcel_cipher_direction {
 	SAFEXCEL_DECRYPT,
 };
 
+enum safexcel_cipher_algo {
+	SAFEXCEL_DES,
+	SAFEXCEL_3DES,
+	SAFEXCEL_AES,
+};
+
 struct safexcel_cipher_ctx {
 	struct safexcel_context base;
 	struct safexcel_crypto_priv *priv;
 
 	u32 mode;
+	enum safexcel_cipher_algo algo;
 
 	__le32 key[8];
 	unsigned int key_len;
@@ -48,10 +56,25 @@ static void safexcel_cipher_token(struct safexcel_cipher_ctx *ctx,
 	unsigned offset = 0;
 
 	if (ctx->mode == CONTEXT_CONTROL_CRYPTO_MODE_CBC) {
-		offset = AES_BLOCK_SIZE / sizeof(u32);
-		memcpy(cdesc->control_data.token, req->iv, AES_BLOCK_SIZE);
+		switch (ctx->algo) {
+		case SAFEXCEL_DES:
+			offset = DES_BLOCK_SIZE / sizeof(u32);
+			memcpy(cdesc->control_data.token, req->iv, DES_BLOCK_SIZE);
+			cdesc->control_data.options |= EIP197_OPTION_2_TOKEN_IV_CMD;
+			break;
 
-		cdesc->control_data.options |= EIP197_OPTION_4_TOKEN_IV_CMD;
+		case SAFEXCEL_3DES:
+			offset = DES3_EDE_BLOCK_SIZE / sizeof(u32);
+			memcpy(cdesc->control_data.token, req->iv, DES3_EDE_BLOCK_SIZE);
+			cdesc->control_data.options |= EIP197_OPTION_2_TOKEN_IV_CMD;
+			break;
+
+		case SAFEXCEL_AES:
+			offset = AES_BLOCK_SIZE / sizeof(u32);
+			memcpy(cdesc->control_data.token, req->iv, AES_BLOCK_SIZE);
+			cdesc->control_data.options |= EIP197_OPTION_4_TOKEN_IV_CMD;
+			break;
+		}
 	}
 
 	token = (struct safexcel_token *)(cdesc->control_data.token + offset);
@@ -104,7 +127,7 @@ static int safexcel_context_control(struct safexcel_cipher_ctx *ctx,
 	struct safexcel_crypto_priv *priv = ctx->priv;
 	struct skcipher_request *req = skcipher_request_cast(async);
 	struct safexcel_cipher_req *sreq = skcipher_request_ctx(req);
-	int ctrl_size;
+	int ctrl_size = ctx->key_len / sizeof(u32);
 
 	if (sreq->direction == SAFEXCEL_ENCRYPT)
 		cdesc->control_data.control0 |= CONTEXT_CONTROL_TYPE_CRYPTO_OUT;
@@ -114,23 +137,26 @@ static int safexcel_context_control(struct safexcel_cipher_ctx *ctx,
 	cdesc->control_data.control0 |= CONTEXT_CONTROL_KEY_EN;
 	cdesc->control_data.control1 |= ctx->mode;
 
-	switch (ctx->key_len) {
-	case AES_KEYSIZE_128:
-		cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_AES128;
-		ctrl_size = 4;
-		break;
-	case AES_KEYSIZE_192:
-		cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_AES192;
-		ctrl_size = 6;
-		break;
-	case AES_KEYSIZE_256:
-		cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_AES256;
-		ctrl_size = 8;
-		break;
-	default:
-		dev_err(priv->dev, "aes keysize not supported: %u\n",
-			ctx->key_len);
-		return -EINVAL;
+	if (ctx->algo == SAFEXCEL_AES) {
+		switch (ctx->key_len) {
+		case AES_KEYSIZE_128:
+			cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_AES128;
+			break;
+		case AES_KEYSIZE_192:
+			cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_AES192;
+			break;
+		case AES_KEYSIZE_256:
+			cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_AES256;
+			break;
+		default:
+			dev_err(priv->dev, "aes keysize not supported: %u\n",
+				ctx->key_len);
+			return -EINVAL;
+		}
+	} else if (ctx->algo == SAFEXCEL_DES) {
+		cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_DES;
+	} else if (ctx->algo == SAFEXCEL_3DES) {
+		cdesc->control_data.control0 |= CONTEXT_CONTROL_CRYPTO_ALG_3DES;
 	}
 	cdesc->control_data.control0 |= CONTEXT_CONTROL_SIZE(ctrl_size);
 
@@ -188,7 +214,7 @@ static int safexcel_handle_req_result(struct safexcel_crypto_priv *priv, int rin
 	return ndesc;
 }
 
-static int safexcel_aes_send(struct crypto_async_request *async,
+static int safexcel_send_req(struct crypto_async_request *async,
 			     int ring, struct safexcel_request *request,
 			     int *commands, int *results)
 {
@@ -423,7 +449,7 @@ static int safexcel_send(struct crypto_async_request *async,
 		ret = safexcel_cipher_send_inv(async, ring, request,
 					       commands, results);
 	else
-		ret = safexcel_aes_send(async, ring, request,
+		ret = safexcel_send_req(async, ring, request,
 					commands, results);
 	return ret;
 }
@@ -468,8 +494,9 @@ static int safexcel_cipher_exit_inv(struct crypto_tfm *tfm)
 	return 0;
 }
 
-static int safexcel_aes(struct skcipher_request *req,
-			enum safexcel_cipher_direction dir, u32 mode)
+static int safexcel_queue_req(struct skcipher_request *req,
+			      enum safexcel_cipher_direction dir, u32 mode,
+			      enum safexcel_cipher_algo algo)
 {
 	struct safexcel_cipher_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
 	struct safexcel_cipher_req *sreq = skcipher_request_ctx(req);
@@ -479,6 +506,7 @@ static int safexcel_aes(struct skcipher_request *req,
 	sreq->needs_inv = false;
 	sreq->direction = dir;
 	ctx->mode = mode;
+	ctx->algo = algo;
 
 	if (ctx->base.ctxr) {
 		if (priv->version == EIP197 && ctx->base.needs_inv) {
@@ -508,14 +536,16 @@ static int safexcel_aes(struct skcipher_request *req,
 
 static int safexcel_ecb_aes_encrypt(struct skcipher_request *req)
 {
-	return safexcel_aes(req, SAFEXCEL_ENCRYPT,
-			    CONTEXT_CONTROL_CRYPTO_MODE_ECB);
+	return safexcel_queue_req(req, SAFEXCEL_ENCRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_ECB,
+				  SAFEXCEL_AES);
 }
 
 static int safexcel_ecb_aes_decrypt(struct skcipher_request *req)
 {
-	return safexcel_aes(req, SAFEXCEL_DECRYPT,
-			    CONTEXT_CONTROL_CRYPTO_MODE_ECB);
+	return safexcel_queue_req(req, SAFEXCEL_DECRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_ECB,
+				  SAFEXCEL_AES);
 }
 
 static int safexcel_skcipher_cra_init(struct crypto_tfm *tfm)
@@ -541,13 +571,13 @@ static void safexcel_skcipher_cra_exit(struct crypto_tfm *tfm)
 	struct safexcel_crypto_priv *priv = ctx->priv;
 	int ret;
 
-	memzero_explicit(ctx->key, 8 * sizeof(u32));
+	memzero_explicit(ctx->key, ctx->key_len);
 
 	/* context not allocated, skip invalidation */
 	if (!ctx->base.ctxr)
 		return;
 
-	memzero_explicit(ctx->base.ctxr->data, 8 * sizeof(u32));
+	memzero_explicit(ctx->base.ctxr->data, ctx->key_len);
 
 	if (priv->version == EIP197) {
 		ret = safexcel_cipher_exit_inv(tfm);
@@ -585,14 +615,16 @@ struct safexcel_alg_template safexcel_alg_ecb_aes = {
 
 static int safexcel_cbc_aes_encrypt(struct skcipher_request *req)
 {
-	return safexcel_aes(req, SAFEXCEL_ENCRYPT,
-			    CONTEXT_CONTROL_CRYPTO_MODE_CBC);
+	return safexcel_queue_req(req, SAFEXCEL_ENCRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_CBC,
+				  SAFEXCEL_AES);
 }
 
 static int safexcel_cbc_aes_decrypt(struct skcipher_request *req)
 {
-	return safexcel_aes(req, SAFEXCEL_DECRYPT,
-			    CONTEXT_CONTROL_CRYPTO_MODE_CBC);
+	return safexcel_queue_req(req, SAFEXCEL_DECRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_CBC,
+				  SAFEXCEL_AES);
 }
 
 struct safexcel_alg_template safexcel_alg_cbc_aes = {
@@ -611,6 +643,218 @@ struct safexcel_alg_template safexcel_alg_cbc_aes = {
 			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC |
 				     CRYPTO_ALG_KERN_DRIVER_ONLY,
 			.cra_blocksize = AES_BLOCK_SIZE,
+			.cra_ctxsize = sizeof(struct safexcel_cipher_ctx),
+			.cra_alignmask = 0,
+			.cra_init = safexcel_skcipher_cra_init,
+			.cra_exit = safexcel_skcipher_cra_exit,
+			.cra_module = THIS_MODULE,
+		},
+	},
+};
+
+static int safexcel_cbc_des_encrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_ENCRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_CBC,
+				  SAFEXCEL_DES);
+}
+
+static int safexcel_cbc_des_decrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_DECRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_CBC,
+				  SAFEXCEL_DES);
+}
+
+static int safexcel_des_setkey(struct crypto_skcipher *ctfm, const u8 *key,
+			       unsigned int len)
+{
+	struct crypto_tfm *tfm = crypto_skcipher_tfm(ctfm);
+	struct safexcel_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
+	u32 tmp[DES_EXPKEY_WORDS];
+	int ret;
+
+	if (len != DES_KEY_SIZE) {
+		crypto_skcipher_set_flags(ctfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
+		return -EINVAL;
+	}
+
+	ret = des_ekey(tmp, key);
+	if (!ret && (tfm->crt_flags & CRYPTO_TFM_REQ_WEAK_KEY)) {
+		tfm->crt_flags |= CRYPTO_TFM_RES_WEAK_KEY;
+		return -EINVAL;
+	}
+
+	/* if context exits and key changed, need to invalidate it */
+	if (ctx->base.ctxr_dma) {
+		if (memcmp(ctx->key, key, len))
+			ctx->base.needs_inv = true;
+	}
+
+	memcpy(ctx->key, key, len);
+
+	ctx->key_len = len;
+
+	return 0;
+}
+
+struct safexcel_alg_template safexcel_alg_cbc_des = {
+	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
+	.alg.skcipher = {
+		.setkey = safexcel_des_setkey,
+		.encrypt = safexcel_cbc_des_encrypt,
+		.decrypt = safexcel_cbc_des_decrypt,
+		.min_keysize = DES_KEY_SIZE,
+		.max_keysize = DES_KEY_SIZE,
+		.ivsize = DES_BLOCK_SIZE,
+		.base = {
+			.cra_name = "cbc(des)",
+			.cra_driver_name = "safexcel-cbc-des",
+			.cra_priority = 300,
+			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC |
+				     CRYPTO_ALG_KERN_DRIVER_ONLY,
+			.cra_blocksize = DES_BLOCK_SIZE,
+			.cra_ctxsize = sizeof(struct safexcel_cipher_ctx),
+			.cra_alignmask = 0,
+			.cra_init = safexcel_skcipher_cra_init,
+			.cra_exit = safexcel_skcipher_cra_exit,
+			.cra_module = THIS_MODULE,
+		},
+	},
+};
+
+static int safexcel_ecb_des_encrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_ENCRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_ECB,
+				  SAFEXCEL_DES);
+}
+
+static int safexcel_ecb_des_decrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_DECRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_ECB,
+				  SAFEXCEL_DES);
+}
+
+struct safexcel_alg_template safexcel_alg_ecb_des = {
+	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
+	.alg.skcipher = {
+		.setkey = safexcel_des_setkey,
+		.encrypt = safexcel_ecb_des_encrypt,
+		.decrypt = safexcel_ecb_des_decrypt,
+		.min_keysize = DES_KEY_SIZE,
+		.max_keysize = DES_KEY_SIZE,
+		.ivsize = DES_BLOCK_SIZE,
+		.base = {
+			.cra_name = "ecb(des)",
+			.cra_driver_name = "safexcel-ecb-des",
+			.cra_priority = 300,
+			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC |
+				     CRYPTO_ALG_KERN_DRIVER_ONLY,
+			.cra_blocksize = DES_BLOCK_SIZE,
+			.cra_ctxsize = sizeof(struct safexcel_cipher_ctx),
+			.cra_alignmask = 0,
+			.cra_init = safexcel_skcipher_cra_init,
+			.cra_exit = safexcel_skcipher_cra_exit,
+			.cra_module = THIS_MODULE,
+		},
+	},
+};
+
+static int safexcel_cbc_des3_ede_encrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_ENCRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_CBC,
+				  SAFEXCEL_3DES);
+}
+
+static int safexcel_cbc_des3_ede_decrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_DECRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_CBC,
+				  SAFEXCEL_3DES);
+}
+
+static int safexcel_des3_ede_setkey(struct crypto_skcipher *ctfm,
+				   const u8 *key, unsigned int len)
+{
+	struct crypto_tfm *tfm = crypto_skcipher_tfm(ctfm);
+	struct safexcel_cipher_ctx *ctx = crypto_tfm_ctx(tfm);
+
+	if (len != DES3_EDE_KEY_SIZE) {
+		crypto_skcipher_set_flags(ctfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
+		return -EINVAL;
+	}
+
+	/* if context exits and key changed, need to invalidate it */
+	if (ctx->base.ctxr_dma) {
+		if (memcmp(ctx->key, key, len))
+			ctx->base.needs_inv = true;
+	}
+
+	memcpy(ctx->key, key, len);
+
+	ctx->key_len = len;
+
+	return 0;
+}
+
+struct safexcel_alg_template safexcel_alg_cbc_des3_ede = {
+	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
+	.alg.skcipher = {
+		.setkey = safexcel_des3_ede_setkey,
+		.encrypt = safexcel_cbc_des3_ede_encrypt,
+		.decrypt = safexcel_cbc_des3_ede_decrypt,
+		.min_keysize = DES3_EDE_KEY_SIZE,
+		.max_keysize = DES3_EDE_KEY_SIZE,
+		.ivsize = DES3_EDE_BLOCK_SIZE,
+		.base = {
+			.cra_name = "cbc(des3_ede)",
+			.cra_driver_name = "safexcel-cbc-des3_ede",
+			.cra_priority = 300,
+			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC |
+				     CRYPTO_ALG_KERN_DRIVER_ONLY,
+			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+			.cra_ctxsize = sizeof(struct safexcel_cipher_ctx),
+			.cra_alignmask = 0,
+			.cra_init = safexcel_skcipher_cra_init,
+			.cra_exit = safexcel_skcipher_cra_exit,
+			.cra_module = THIS_MODULE,
+		},
+	},
+};
+
+static int safexcel_ecb_des3_ede_encrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_ENCRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_ECB,
+				  SAFEXCEL_3DES);
+}
+
+static int safexcel_ecb_des3_ede_decrypt(struct skcipher_request *req)
+{
+	return safexcel_queue_req(req, SAFEXCEL_DECRYPT,
+				  CONTEXT_CONTROL_CRYPTO_MODE_ECB,
+				  SAFEXCEL_3DES);
+}
+
+struct safexcel_alg_template safexcel_alg_ecb_des3_ede = {
+	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
+	.alg.skcipher = {
+		.setkey = safexcel_des3_ede_setkey,
+		.encrypt = safexcel_ecb_des3_ede_encrypt,
+		.decrypt = safexcel_ecb_des3_ede_decrypt,
+		.min_keysize = DES3_EDE_KEY_SIZE,
+		.max_keysize = DES3_EDE_KEY_SIZE,
+		.ivsize = DES3_EDE_BLOCK_SIZE,
+		.base = {
+			.cra_name = "ecb(des3_ede)",
+			.cra_driver_name = "safexcel-ecb-des3_ede",
+			.cra_priority = 300,
+			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER | CRYPTO_ALG_ASYNC |
+				     CRYPTO_ALG_KERN_DRIVER_ONLY,
+			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
 			.cra_ctxsize = sizeof(struct safexcel_cipher_ctx),
 			.cra_alignmask = 0,
 			.cra_init = safexcel_skcipher_cra_init,
