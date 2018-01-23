@@ -23,6 +23,15 @@ struct safexcel_ahash_ctx {
 	u32 alg;
 	u32 digest;
 
+	u8 state_sz;    /* expected sate size, only set once */
+	u32 *state;
+	dma_addr_t state_dma;
+
+	u8 *cache;
+	dma_addr_t cache_dma;
+
+	u8 cache_next[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
+
 	u32 ipad[SHA1_DIGEST_SIZE / sizeof(u32)];
 	u32 opad[SHA1_DIGEST_SIZE / sizeof(u32)];
 };
@@ -34,15 +43,8 @@ struct safexcel_ahash_req {
 	bool needs_inv;
 
 	int nents;
-
-	u8 state_sz;    /* expected sate size, only set once */
-	u32 state[SHA256_DIGEST_SIZE / sizeof(u32)] __aligned(sizeof(u32));
-
 	u64 len;
 	u64 processed;
-
-	u8 cache[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
-	u8 cache_next[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
 };
 
 struct safexcel_ahash_export_state {
@@ -107,7 +109,7 @@ static void safexcel_context_control(struct safexcel_ahash_ctx *ctx,
 		 */
 		if (req->processed) {
 			for (i = 0; i < digestsize / sizeof(u32); i++)
-				ctx->base.ctxr->data[i] = cpu_to_le32(req->state[i]);
+				ctx->base.ctxr->data[i] = cpu_to_le32(ctx->state[i]);
 
 			if (req->finish)
 				ctx->base.ctxr->data[i] = cpu_to_le32(req->processed / blocksize);
@@ -127,7 +129,7 @@ static int safexcel_handle_req_result(struct safexcel_crypto_priv *priv, int rin
 {
 	struct safexcel_result_desc *rdesc;
 	struct ahash_request *areq = ahash_request_cast(async);
-	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	struct safexcel_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
 	struct safexcel_ahash_req *sreq = ahash_request_ctx(areq);
 	int cache_len;
 
@@ -150,19 +152,16 @@ static int safexcel_handle_req_result(struct safexcel_crypto_priv *priv, int rin
 	spin_unlock_bh(&priv->ring[ring].egress_lock);
 
 	if (sreq->finish)
-		memcpy(areq->result, sreq->state,
-		       crypto_ahash_digestsize(ahash));
+		memcpy(areq->result, ctx->state, ctx->state_sz);
 
 	if (sreq->nents) {
 		dma_unmap_sg(priv->dev, areq->src, sreq->nents, DMA_TO_DEVICE);
 		sreq->nents = 0;
 	}
 
-	safexcel_free_context(priv, async, sreq->state_sz);
-
 	cache_len = sreq->len - sreq->processed;
 	if (cache_len)
-		memcpy(sreq->cache, sreq->cache_next, cache_len);
+		memcpy(ctx->cache, ctx->cache_next, cache_len);
 
 	*should_complete = true;
 
@@ -202,7 +201,7 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
 
 		if (extra) {
 			sg_pcopy_to_buffer(areq->src, sg_nents(areq->src),
-					   req->cache_next, extra,
+					   ctx->cache_next, extra,
 					   areq->nbytes - extra);
 
 			queued -= extra;
@@ -220,28 +219,13 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
 
 	/* Add a command descriptor for the cached data, if any */
 	if (cache_len) {
-		ctx->base.cache = kzalloc(cache_len, EIP197_GFP_FLAGS(*async));
-		if (!ctx->base.cache) {
-			ret = -ENOMEM;
-			goto unlock;
-		}
-		memcpy(ctx->base.cache, req->cache, cache_len);
-		ctx->base.cache_dma = dma_map_single(priv->dev, ctx->base.cache,
-						     cache_len, DMA_TO_DEVICE);
-		if (dma_mapping_error(priv->dev, ctx->base.cache_dma)) {
-			ret = -EINVAL;
-			goto free_cache;
-		}
-
-		ctx->base.cache_sz = cache_len;
 		first_cdesc = safexcel_add_cdesc(priv, ring, 1,
 						 (cache_len == len),
-						 ctx->base.cache_dma,
-						 cache_len, len,
-						 ctx->base.ctxr_dma);
+						 ctx->cache_dma, cache_len,
+						 len, ctx->base.ctxr_dma);
 		if (IS_ERR(first_cdesc)) {
 			ret = PTR_ERR(first_cdesc);
-			goto unmap_cache;
+			goto unlock;
 		}
 		n_cdesc++;
 
@@ -271,7 +255,7 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
 					   sglen, len, ctx->base.ctxr_dma);
 		if (IS_ERR(cdesc)) {
 			ret = PTR_ERR(cdesc);
-			goto cdesc_rollback;
+			goto unmap_sg;
 		}
 		n_cdesc++;
 
@@ -285,25 +269,18 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
 
 send_command:
 	/* Setup the context options */
-	safexcel_context_control(ctx, req, first_cdesc, req->state_sz,
+	safexcel_context_control(ctx, req, first_cdesc, ctx->state_sz,
 				 crypto_ahash_blocksize(ahash));
 
 	/* Add the token */
-	safexcel_hash_token(first_cdesc, len, req->state_sz);
-
-	ctx->base.result_dma = dma_map_single(priv->dev, req->state,
-					      req->state_sz, DMA_FROM_DEVICE);
-	if (dma_mapping_error(priv->dev, ctx->base.result_dma)) {
-		ret = -EINVAL;
-		goto cdesc_rollback;
-	}
+	safexcel_hash_token(first_cdesc, len, ctx->state_sz);
 
 	/* Add a result descriptor */
-	rdesc = safexcel_add_rdesc(priv, ring, 1, 1, ctx->base.result_dma,
-				   req->state_sz);
+	rdesc = safexcel_add_rdesc(priv, ring, 1, 1, ctx->state_dma,
+				   ctx->state_sz);
 	if (IS_ERR(rdesc)) {
 		ret = PTR_ERR(rdesc);
-		goto unmap_result;
+		goto unmap_sg;
 	}
 
 	spin_unlock_bh(&priv->ring[ring].egress_lock);
@@ -315,21 +292,11 @@ send_command:
 	*results = 1;
 	return 0;
 
-unmap_result:
+unmap_sg:
 	dma_unmap_sg(priv->dev, areq->src, req->nents, DMA_TO_DEVICE);
 cdesc_rollback:
 	for (i = 0; i < n_cdesc; i++)
 		safexcel_ring_rollback_wptr(priv, &priv->ring[ring].cdr);
-unmap_cache:
-	if (ctx->base.cache_dma) {
-		dma_unmap_single(priv->dev, ctx->base.cache_dma,
-				 ctx->base.cache_sz, DMA_TO_DEVICE);
-		ctx->base.cache_sz = 0;
-	}
-free_cache:
-	kfree(ctx->base.cache);
-	ctx->base.cache = NULL;
-
 unlock:
 	spin_unlock_bh(&priv->ring[ring].egress_lock);
 	return ret;
@@ -340,11 +307,11 @@ static inline bool safexcel_ahash_needs_inv_get(struct ahash_request *areq)
 	struct safexcel_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
 	struct safexcel_ahash_req *req = ahash_request_ctx(areq);
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
-	unsigned int state_w_sz = req->state_sz / sizeof(u32);
+	unsigned int state_w_sz = ctx->state_sz / sizeof(u32);
 	int i;
 
 	for (i = 0; i < state_w_sz; i++)
-		if (ctx->base.ctxr->data[i] != cpu_to_le32(req->state[i]))
+		if (ctx->base.ctxr->data[i] != cpu_to_le32(ctx->state[i]))
 			return true;
 
 	if (ctx->base.ctxr->data[state_w_sz] !=
@@ -513,6 +480,7 @@ static int safexcel_ahash_cache(struct ahash_request *areq)
 {
 	struct safexcel_ahash_req *req = ahash_request_ctx(areq);
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	struct safexcel_ahash_ctx *ctx = crypto_ahash_ctx(ahash);
 	int queued, cache_len;
 
 	/* cache_len: everyting accepted by the driver but not sent yet,
@@ -531,7 +499,7 @@ static int safexcel_ahash_cache(struct ahash_request *areq)
 	 */
 	if (cache_len + areq->nbytes <= crypto_ahash_blocksize(ahash)) {
 		sg_pcopy_to_buffer(areq->src, sg_nents(areq->src),
-				   req->cache + cache_len,
+				   ctx->cache + cache_len,
 				   areq->nbytes, 0);
 		return areq->nbytes;
 	}
@@ -657,13 +625,14 @@ static int safexcel_ahash_export(struct ahash_request *areq, void *out)
 {
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
 	struct safexcel_ahash_req *req = ahash_request_ctx(areq);
+	struct safexcel_ahash_ctx *ctx = crypto_ahash_ctx(ahash);
 	struct safexcel_ahash_export_state *export = out;
 
 	export->len = req->len;
 	export->processed = req->processed;
 
-	memcpy(export->state, req->state, req->state_sz);
-	memcpy(export->cache, req->cache, crypto_ahash_blocksize(ahash));
+	memcpy(export->state, ctx->state, ctx->state_sz);
+	memcpy(export->cache, ctx->cache, crypto_ahash_blocksize(ahash));
 
 	return 0;
 }
@@ -672,6 +641,7 @@ static int safexcel_ahash_import(struct ahash_request *areq, const void *in)
 {
 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
 	struct safexcel_ahash_req *req = ahash_request_ctx(areq);
+	struct safexcel_ahash_ctx *ctx = crypto_ahash_ctx(ahash);
 	const struct safexcel_ahash_export_state *export = in;
 	int ret;
 
@@ -682,8 +652,8 @@ static int safexcel_ahash_import(struct ahash_request *areq, const void *in)
 	req->len = export->len;
 	req->processed = export->processed;
 
-	memcpy(req->cache, export->cache, crypto_ahash_blocksize(ahash));
-	memcpy(req->state, export->state, req->state_sz);
+	memcpy(ctx->cache, export->cache, crypto_ahash_blocksize(ahash));
+	memcpy(ctx->state, export->state, ctx->state_sz);
 
 	return 0;
 }
@@ -699,6 +669,20 @@ static int safexcel_ahash_cra_init(struct crypto_tfm *tfm)
 	ctx->base.send = safexcel_ahash_send;
 	ctx->base.handle_result = safexcel_handle_result;
 
+	ctx->state = dma_pool_alloc(ctx->priv->hash_state_pool, GFP_KERNEL,
+				    &ctx->state_dma);
+	if (!ctx->state)
+		return -ENOMEM;
+
+	ctx->cache = dma_pool_alloc(ctx->priv->hash_cache_pool, GFP_KERNEL,
+				    &ctx->cache_dma);
+	if (!ctx->cache) {
+		dma_pool_free(ctx->priv->hash_state_pool, ctx->state,
+			      ctx->state_dma);
+		return -ENOMEM;
+	}
+
+
 	crypto_ahash_set_reqsize(__crypto_ahash_cast(tfm),
 				 sizeof(struct safexcel_ahash_req));
 	return 0;
@@ -711,15 +695,15 @@ static int safexcel_sha1_init(struct ahash_request *areq)
 
 	memset(req, 0, sizeof(*req));
 
-	req->state[0] = SHA1_H0;
-	req->state[1] = SHA1_H1;
-	req->state[2] = SHA1_H2;
-	req->state[3] = SHA1_H3;
-	req->state[4] = SHA1_H4;
+	ctx->state[0] = SHA1_H0;
+	ctx->state[1] = SHA1_H1;
+	ctx->state[2] = SHA1_H2;
+	ctx->state[3] = SHA1_H3;
+	ctx->state[4] = SHA1_H4;
 
 	ctx->alg = CONTEXT_CONTROL_CRYPTO_ALG_SHA1;
 	ctx->digest = CONTEXT_CONTROL_DIGEST_PRECOMPUTED;
-	req->state_sz = SHA1_DIGEST_SIZE;
+	ctx->state_sz = SHA1_DIGEST_SIZE;
 
 	return 0;
 }
@@ -739,6 +723,9 @@ static void safexcel_ahash_cra_exit(struct crypto_tfm *tfm)
 	struct safexcel_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
 	struct safexcel_crypto_priv *priv = ctx->priv;
 	int ret;
+
+	dma_pool_free(priv->hash_state_pool, ctx->state, ctx->state_dma);
+	dma_pool_free(priv->hash_cache_pool, ctx->cache, ctx->cache_dma);
 
 	/* context not allocated, skip invalidation */
 	if (!ctx->base.ctxr)
@@ -1016,18 +1003,18 @@ static int safexcel_sha256_init(struct ahash_request *areq)
 
 	memset(req, 0, sizeof(*req));
 
-	req->state[0] = SHA256_H0;
-	req->state[1] = SHA256_H1;
-	req->state[2] = SHA256_H2;
-	req->state[3] = SHA256_H3;
-	req->state[4] = SHA256_H4;
-	req->state[5] = SHA256_H5;
-	req->state[6] = SHA256_H6;
-	req->state[7] = SHA256_H7;
+	ctx->state[0] = SHA256_H0;
+	ctx->state[1] = SHA256_H1;
+	ctx->state[2] = SHA256_H2;
+	ctx->state[3] = SHA256_H3;
+	ctx->state[4] = SHA256_H4;
+	ctx->state[5] = SHA256_H5;
+	ctx->state[6] = SHA256_H6;
+	ctx->state[7] = SHA256_H7;
 
 	ctx->alg = CONTEXT_CONTROL_CRYPTO_ALG_SHA256;
 	ctx->digest = CONTEXT_CONTROL_DIGEST_PRECOMPUTED;
-	req->state_sz = SHA256_DIGEST_SIZE;
+	ctx->state_sz = SHA256_DIGEST_SIZE;
 
 	return 0;
 }
@@ -1078,18 +1065,18 @@ static int safexcel_sha224_init(struct ahash_request *areq)
 
 	memset(req, 0, sizeof(*req));
 
-	req->state[0] = SHA224_H0;
-	req->state[1] = SHA224_H1;
-	req->state[2] = SHA224_H2;
-	req->state[3] = SHA224_H3;
-	req->state[4] = SHA224_H4;
-	req->state[5] = SHA224_H5;
-	req->state[6] = SHA224_H6;
-	req->state[7] = SHA224_H7;
+	ctx->state[0] = SHA224_H0;
+	ctx->state[1] = SHA224_H1;
+	ctx->state[2] = SHA224_H2;
+	ctx->state[3] = SHA224_H3;
+	ctx->state[4] = SHA224_H4;
+	ctx->state[5] = SHA224_H5;
+	ctx->state[6] = SHA224_H6;
+	ctx->state[7] = SHA224_H7;
 
 	ctx->alg = CONTEXT_CONTROL_CRYPTO_ALG_SHA224;
 	ctx->digest = CONTEXT_CONTROL_DIGEST_PRECOMPUTED;
-	req->state_sz = SHA256_DIGEST_SIZE;
+	ctx->state_sz = SHA256_DIGEST_SIZE;
 
 	return 0;
 }

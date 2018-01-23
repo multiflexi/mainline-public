@@ -8,6 +8,7 @@
  * warranty of any kind, whether express or implied.
  */
 
+#include <crypto/sha.h>
 #include <linux/clk.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -537,25 +538,6 @@ finalize:
 	       EIP197_HIA_CDR(priv, ring) + EIP197_HIA_xDR_PREP_COUNT);
 }
 
-void safexcel_free_context(struct safexcel_crypto_priv *priv,
-			   struct crypto_async_request *req,
-			   int result_sz)
-{
-	struct safexcel_context *ctx = crypto_tfm_ctx(req->tfm);
-
-	if (ctx->result_dma)
-		dma_unmap_single(priv->dev, ctx->result_dma, result_sz,
-				 DMA_FROM_DEVICE);
-
-	if (ctx->cache) {
-		dma_unmap_single(priv->dev, ctx->cache_dma, ctx->cache_sz,
-				 DMA_TO_DEVICE);
-		kfree(ctx->cache);
-		ctx->cache = NULL;
-		ctx->cache_sz = 0;
-	}
-}
-
 void safexcel_complete(struct safexcel_crypto_priv *priv, int ring)
 {
 	struct safexcel_command_desc *cdesc;
@@ -920,7 +902,14 @@ static int safexcel_probe(struct platform_device *pdev)
 	priv->context_pool = dmam_pool_create("safexcel-context", dev,
 					      sizeof(struct safexcel_context_record),
 					      1, 0);
-	if (!priv->context_pool) {
+	priv->hash_state_pool = dmam_pool_create("safexcel-hash-state", dev,
+						 SHA256_DIGEST_SIZE / sizeof(u32),
+						 sizeof(u64), 0);
+	priv->hash_cache_pool = dmam_pool_create("safexcel-hash-cache", dev,
+						 SHA256_BLOCK_SIZE,
+						 sizeof(u64), 0);
+	if (!priv->context_pool || !priv->hash_state_pool ||
+	    !priv->hash_cache_pool) {
 		ret = -ENOMEM;
 		goto err_clk;
 	}

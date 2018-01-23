@@ -532,6 +532,10 @@ struct safexcel_crypto_priv {
 
 	/* context DMA pool */
 	struct dma_pool *context_pool;
+	/* hash state DMA pool */
+	struct dma_pool *hash_state_pool;
+	/* hash cache DMA pool */
+	struct dma_pool *hash_cache_pool;
 
 	atomic_t ring_used;
 
@@ -578,12 +582,6 @@ struct safexcel_context {
 	int ring;
 	bool needs_inv;
 	bool exit_inv;
-
-	/* Used for ahash requests */
-	dma_addr_t result_dma;
-	void *cache;
-	dma_addr_t cache_dma;
-	unsigned int cache_sz;
 };
 
 /*
@@ -607,9 +605,6 @@ struct safexcel_inv_result {
 
 void safexcel_dequeue(struct safexcel_crypto_priv *priv, int ring);
 void safexcel_complete(struct safexcel_crypto_priv *priv, int ring);
-void safexcel_free_context(struct safexcel_crypto_priv *priv,
-				  struct crypto_async_request *req,
-				  int result_sz);
 int safexcel_invalidate_cache(struct crypto_async_request *async,
 			      struct safexcel_crypto_priv *priv,
 			      dma_addr_t ctxr_dma, int ring,
