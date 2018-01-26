@@ -194,6 +194,7 @@ static void __init armada37xx_cpufreq_avs_setup(struct regmap *base,
 
 
 	/* Set VDD for VSET 0 */
+	/*
 	freq = dvfs->cpu_freq_max / dvfs->divider[0];
 	armada37xx_cpufreq_get_avs(&dvfs->uvolt[0], &avs_val, freq);
 	pr_err ("%s lvl=%d avs=%d\n", __func__, load_level, avs_val);
@@ -203,7 +204,7 @@ static void __init armada37xx_cpufreq_avs_setup(struct regmap *base,
 		ARMADA_37XX_AVS_VDD_MASK << ARMADA_37XX_AVS_LOW_VDD_LIMIT,
 			   avs_val << ARMADA_37XX_AVS_HIGH_VDD_LIMIT |
 			   avs_val << ARMADA_37XX_AVS_LOW_VDD_LIMIT);
-
+	*/
 	for (load_level = 1; load_level < LOAD_LEVEL_NR; load_level++) {
 		freq = dvfs->cpu_freq_max / dvfs->divider[load_level];
 
