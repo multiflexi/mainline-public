@@ -1246,7 +1246,7 @@ struct mvpp2_tx_queue {
 
 	/* Index of the next Tx DMA descriptor to process */
 	int next_desc_to_proc;
-};
+} ____cacheline_aligned;
 
 struct mvpp2_rx_queue {
 	/* RX queue number, in the range 0-31 for physical RXQs */
