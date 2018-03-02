@@ -1071,6 +1071,7 @@ static struct safexcel_alg_template *safexcel_eip197_algs[] = {
 	&safexcel_alg_authenc_hmac_sha1_cbc_aes,
 	&safexcel_alg_authenc_hmac_sha224_cbc_aes,
 	&safexcel_alg_authenc_hmac_sha256_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha512_cbc_aes,
 };
 
 static const struct safexcel_data eip197_data = {
