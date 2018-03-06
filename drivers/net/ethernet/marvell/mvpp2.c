@@ -4170,7 +4170,10 @@ static void mvpp2_cls_init(struct mvpp2 *priv)
 	int index;
 	u32 flow;
 
-	/* Clear classifier lookup table */
+	/* Enable classifier */
+	mvpp2_write(priv, MVPP2_CLS_MODE_REG, MVPP2_CLS_MODE_ACTIVE_MASK);
+
+	/* Initialize the CLS lookup table */
 	flow = (priv->rss_hash == MVPP22_RSS_UDP_5T) ?
 	       MVPP22_CLS_FLOW_RSS_5T : MVPP22_CLS_FLOW_RSS_2T;
 	le.data = MVPP22_CLS_LKP_FLOW_ID(flow) | MVPP22_CLS_LKP_EN;
@@ -4197,7 +4200,8 @@ static void mvpp2_cls_init(struct mvpp2 *priv)
 	/* RSS specific flows: UDP 2T */
 	fe.index = MVPP22_CLS_FLOW_RSS_2T;
 	fe.data[0] = MVPP22_CLS_FLOW_ENGINE(MVPP22_CLS_ENGINE_C3HA) |
-		     MVPP22_CLS_FLOW_LAST | MVPP22_CLS_FLOW_PORT_ID(0xff);
+		     MVPP22_CLS_FLOW_PORT_ID_SEL |
+		     MVPP22_CLS_FLOW_LAST;
 	fe.data[1] = MVPP22_CLS_FLOW_N_FIELDS(2);
 	fe.data[2] = MVPP22_CLS_FLOW_FIELD(0, 0x10) |
 		     MVPP22_CLS_FLOW_FIELD(1, 0x11);
@@ -4206,16 +4210,14 @@ static void mvpp2_cls_init(struct mvpp2 *priv)
 	/* RSS specific flows: UDP 5T */
 	fe.index = MVPP22_CLS_FLOW_RSS_5T;
 	fe.data[0] = MVPP22_CLS_FLOW_ENGINE(MVPP22_CLS_ENGINE_C3HB) |
-		     MVPP22_CLS_FLOW_LAST | MVPP22_CLS_FLOW_PORT_ID(0xff);
+		     MVPP22_CLS_FLOW_PORT_ID_SEL |
+		     MVPP22_CLS_FLOW_LAST;
 	fe.data[1] = MVPP22_CLS_FLOW_N_FIELDS(4);
 	fe.data[2] = MVPP22_CLS_FLOW_FIELD(0, 0x10) |
 		     MVPP22_CLS_FLOW_FIELD(1, 0x11) |
 		     MVPP22_CLS_FLOW_FIELD(2, 0x1d) |
 		     MVPP22_CLS_FLOW_FIELD(3, 0x1e);
 	mvpp2_cls_flow_write(priv, &fe);
-
-	/* Enable classifier */
-	mvpp2_write(priv, MVPP2_CLS_MODE_REG, MVPP2_CLS_MODE_ACTIVE_MASK);
 }
 
 static void mvpp2_cls_port_config(struct mvpp2_port *port)
