@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (C) 2017 Marvell Technology Group Ltd.
+ *
+ * Device Tree file for Marvell Armada-8082 Development board platform
+ */
+
+#include "armada-8082.dtsi"
+
+/ {
+	model = "Marvell 8082 board";
+	compatible = "marvell,armada-8082-db", "marvell,armada-8082",
+		     "marvell,armada-ap810-octa", "marvell,armada-ap810";
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@00000000 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x80000000>;
+	};
+};
+
+&ap0_uart0 {
+	clock-frequency = <200000000>;
+	status = "okay";
+};
+
+&cp0_sata0 {
+	status = "okay";
+	sata-port@1 {
+		reg = <1>;
+		status = "okay";
+	};
+};
+
+&cp0_pcie0 {
+	status = "okay";
+};
+
+&cp0_usb3_0 {
+	status = "okay";
+};
+
+&cp0_usb3_1 {
+	status = "okay";
+};
+
+&cp1_sata0 {
+	status = "okay";
+	sata-port@1 {
+		reg = <1>;
+		status = "okay";
+	};
+};
+
+&cp1_pcie0 {
+	status = "okay";
+};
