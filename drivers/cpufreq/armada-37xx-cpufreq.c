@@ -66,16 +66,21 @@
  */
 #define LOAD_LEVEL_NR	4
 
+#define MIN_VOLT_MV 1000
+
 /*  AVS value for the corresponding voltage (in mV) */
-#define ARMADA_37XX_AVS_1050MV  0x1a
-#define ARMADA_37XX_AVS_1108MV  0x1f
-#define ARMADA_37XX_AVS_1155MV  0x23
-#define ARMADA_37XX_AVS_1202MV  0x27
+static int avs_map[] = {
+	747, 758, 770, 782, 793, 805, 817, 828, 840, 852, 863, 875, 887, 898,
+	910, 922, 933, 945, 957, 968, 980, 992, 1003, 1015, 1027, 1038, 1050,
+	1062, 1073, 1085, 1097, 1108, 1120, 1132, 1143, 1155, 1167, 1178, 1190,
+	1202, 1213, 1225, 1237, 1248, 1260, 1272, 1283, 1295, 1307, 1318, 1330,
+	1342
+};
 
 struct armada_37xx_dvfs {
 	u32 cpu_freq_max;
 	u8 divider[LOAD_LEVEL_NR];
-	u32 uvolt[LOAD_LEVEL_NR];
+	u32 avs[LOAD_LEVEL_NR];
 };
 
 static struct armada_37xx_dvfs armada_37xx_dvfs[] = {
@@ -153,24 +158,92 @@ static void __init armada37xx_cpufreq_dvfs_setup(struct regmap *base,
 	clk_set_parent(clk, parent);
 }
 
-static void __init armada37xx_cpufreq_get_avs(unsigned int *avs_val,
-					      unsigned int *uvolt,
-					      unsigned int  freq)
+/*
+ * Find out the armada 37x supported avs value whose voltage value is
+ * the round-up closest to the target voltage value.
+ */
+static u32 armada_37xx_avs_val_match(int target_vm)
 {
-		/* These value comes from the hardware designer */
-		if (freq  < 600000000) {
-			*uvolt = 1050000;
-			*avs_val = ARMADA_37XX_AVS_1050MV;
-		} else if (freq <= 800000000) {
-			*uvolt = 1108000;
-			*avs_val = ARMADA_37XX_AVS_1108MV;
-		} else if (freq <= 1000000000) {
-			*uvolt = 1155000;
-			*avs_val = ARMADA_37XX_AVS_1155MV;
-		} else if (freq <= 1200000000) {
-			*uvolt = 1202000;
-			*avs_val = ARMADA_37XX_AVS_1202MV;
-		}
+	u32 avs;
+
+	/* Find out the round-up closest supported voltage value */
+	for (avs = 0; avs < ARRAY_SIZE(avs_map); avs++)
+		if (avs_map[avs] >= target_vm)
+			break;
+
+	/*
+	 * If all supported voltages are smaller than target one,
+	 * choose the largest supported voltage
+	 */
+	if (avs == ARRAY_SIZE(avs_map))
+		avs = ARRAY_SIZE(avs_map) - 1;
+
+	return avs;
+}
+
+/*
+ * For Armada 37x soc, L0(VSET0) VDD avs value is set to SVC revision
+ * value or a default value when SVC is not supported.
+ * - L0 can be read out from the register of AVS_CTRL_0 and L0 voltage
+ *   can be got from the mapping table of avs_map.
+ * - L1 voltage should be about 100mv smaller than L0 voltage
+ * - L2 & L3 voltage should be about 150mv smaller than L0 voltage.
+ * This function calculates L1 & L2 & L3 avs values dynamically based
+ * on L0 voltage and fill all avs values to the avs value table
+ * avs_val_tbl.
+ */
+static void __init armada37xx_cpufreq_avs_configure(struct regmap *base,
+						struct armada_37xx_dvfs *dvfs)
+{
+	unsigned int target_vm;
+	int load_level = 0;
+	u32 l0_vdd_min;
+
+	if (base == NULL)
+		return;
+
+	/* Get L0 VDD min value */
+	regmap_read(base, ARMADA_37XX_AVS_CTL0, &l0_vdd_min);
+	l0_vdd_min = (l0_vdd_min >> ARMADA_37XX_AVS_LOW_VDD_LIMIT) &
+		ARMADA_37XX_AVS_VDD_MASK;
+	pr_err("%s (%X)\n", __func__, l0_vdd_min);
+	if (l0_vdd_min >= ARRAY_SIZE(avs_map))  {
+		pr_err("L0 VDD MIN %d is not correct.\n", l0_vdd_min);
+		return;
+	}
+	dvfs->avs[0] = l0_vdd_min;
+
+	if (avs_map[l0_vdd_min] <= MIN_VOLT_MV) {
+		/*
+		 * If L0 voltage is smaller than 1000mv, then all VDD sets
+		 * use L0 voltage;
+		 */
+		u32 avs_min = armada_37xx_avs_val_match(MIN_VOLT_MV);
+
+		for (load_level = 1; load_level < LOAD_LEVEL_NR; load_level++)
+			dvfs->avs[load_level] = avs_min;
+
+		return;
+	}
+
+	/*
+	 * L1 voltage is equal to L0 vlotage - 100mv and it must be
+	 * larger than 1000mv
+	 */
+
+	target_vm = avs_map[l0_vdd_min] - 100;
+	target_vm = target_vm > MIN_VOLT_MV ? target_vm : MIN_VOLT_MV;
+	dvfs->avs[1] = armada_37xx_avs_val_match(target_vm);
+
+	/*
+	 * L2 & L3 voltage is equal to L0 vlotage - 150mv and it must
+	 * be larger than 1000mv
+	 */
+	target_vm = avs_map[l0_vdd_min] - 150;
+	target_vm = target_vm > MIN_VOLT_MV ? target_vm : MIN_VOLT_MV;
+	dvfs->avs[2] = dvfs->avs[3] = armada_37xx_avs_val_match(target_vm);
+
+	return;
 }
 
 static void __init armada37xx_cpufreq_avs_setup(struct regmap *base,
@@ -193,24 +266,10 @@ static void __init armada37xx_cpufreq_avs_setup(struct regmap *base,
 			   ARMADA_37XX_AVS_LOW_VDD_EN);
 
 
-	/* Set VDD for VSET 0 */
-	/*
-	freq = dvfs->cpu_freq_max / dvfs->divider[0];
-	armada37xx_cpufreq_get_avs(&dvfs->uvolt[0], &avs_val, freq);
-	pr_err ("%s lvl=%d avs=%d\n", __func__, load_level, avs_val);
-
-	regmap_update_bits(base, ARMADA_37XX_AVS_CTL0,
-		ARMADA_37XX_AVS_VDD_MASK << ARMADA_37XX_AVS_HIGH_VDD_LIMIT |
-		ARMADA_37XX_AVS_VDD_MASK << ARMADA_37XX_AVS_LOW_VDD_LIMIT,
-			   avs_val << ARMADA_37XX_AVS_HIGH_VDD_LIMIT |
-			   avs_val << ARMADA_37XX_AVS_LOW_VDD_LIMIT);
-	*/
 	for (load_level = 1; load_level < LOAD_LEVEL_NR; load_level++) {
 		freq = dvfs->cpu_freq_max / dvfs->divider[load_level];
 
-		armada37xx_cpufreq_get_avs(&dvfs->uvolt[load_level], &avs_val,
-					   freq);
-
+		avs_val = dvfs->avs[load_level];
 		pr_err ("%s lvl=%d avs=%d\n", __func__, load_level, avs_val);
 		regmap_update_bits(base, ARMADA_37XX_AVS_VSET(load_level-1),
 		    ARMADA_37XX_AVS_VDD_MASK << ARMADA_37XX_AVS_HIGH_VDD_LIMIT |
@@ -308,6 +367,7 @@ static int __init armada37xx_cpufreq_driver_init(void)
 	if (!dvfs)
 		return -EINVAL;
 
+	armada37xx_cpufreq_avs_configure(avs_base, dvfs);
 	armada37xx_cpufreq_avs_setup(avs_base, dvfs);
 
 	armada37xx_cpufreq_dvfs_setup(nb_pm_base, clk, dvfs->divider);
@@ -315,8 +375,8 @@ static int __init armada37xx_cpufreq_driver_init(void)
 
 	for (load_lvl = ARMADA_37XX_DVFS_LOAD_0; load_lvl < LOAD_LEVEL_NR;
 	     load_lvl++) {
-		unsigned long freq = cur_frequency / dvfs->divider[load_lvl],
-			u_volt = dvfs->uvolt[load_lvl];
+		unsigned long freq = cur_frequency / dvfs->divider[load_lvl];
+		unsigned long u_volt = avs_map[dvfs->avs[load_lvl]] * 1000;
 		pr_err ("%s going to add level %d freq=%ld volt=%ld \n",
 			__func__, load_lvl, freq, u_volt);
 		ret = dev_pm_opp_add(cpu_dev, freq, u_volt);
@@ -328,8 +388,8 @@ static int __init armada37xx_cpufreq_driver_init(void)
 			}
 			return ret;
 		}
-		pr_err ("%s adding level %d freq=%ld volt=%ld \n", __func__,
-			load_lvl, freq, u_volt);
+		pr_err("%s adding level %d freq=%ld volt=%ld\n", __func__,
+		       load_lvl, freq, u_volt);
 
 	}
 
