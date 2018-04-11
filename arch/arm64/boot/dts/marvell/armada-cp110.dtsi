@@ -358,7 +358,7 @@
 		#interrupt-cells = <1>;
 		device_type = "pci";
 		dma-coherent;
-		msi-parent = <&gic_v2m0>;
+		msi-parent = PCIE_MSI_PARENT(0);
 		bus-range = <0 0xff>;
 		ranges =
 			/* downstream I/O */
@@ -390,7 +390,7 @@
 		#interrupt-cells = <1>;
 		device_type = "pci";
 		dma-coherent;
-		msi-parent = <&gic_v2m0>;
+		msi-parent = PCIE_MSI_PARENT(1);
 		bus-range = <0 0xff>;
 		ranges =
 			/* downstream I/O */
@@ -422,7 +422,7 @@
 		#interrupt-cells = <1>;
 		device_type = "pci";
 		dma-coherent;
-		msi-parent = <&gic_v2m0>;
+		msi-parent = PCIE_MSI_PARENT(2);
 		bus-range = <0 0xff>;
 		ranges =
 			/* downstream I/O */
