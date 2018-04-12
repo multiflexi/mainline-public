@@ -148,7 +148,7 @@
 		};
 
 		CP110_LABEL(icu): interrupt-controller@1e0000 {
-			compatible = "marvell,cp110-icu";
+			compatible = "marvell,cp110-icu", "syscon";
 			reg = <0x1e0000 0x440>;
 			#interrupt-cells = <3>;
 			interrupt-controller;
