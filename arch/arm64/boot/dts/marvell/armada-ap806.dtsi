@@ -49,6 +49,7 @@
 /* GIC-v2m in this AP is the XOR MSI parent for CPs south-bridges connected to this AP */
 #define XOR_MSI_PARENT(XOR_NUM) <&gic_v2m0>
 #define PCIE_MSI_PARENT(PCIE) <&gic_v2m0>
+#define ICU_MSI_PARENT <&gicp>
 
 /dts-v1/;
 

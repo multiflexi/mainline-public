@@ -153,7 +153,7 @@
 			reg = <0x1e0000 0x10>;
 			#interrupt-cells = <3>;
 			interrupt-controller;
-			msi-parent = <&gicp>;
+			msi-parent = ICU_MSI_PARENT;
 		};
 
 		CP110_LABEL(rtc): rtc@284000 {
