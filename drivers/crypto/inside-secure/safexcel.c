@@ -933,7 +933,8 @@ static int safexcel_probe(struct platform_device *pdev)
 		if (ret)
 			goto err_core_clk;
 
-		ret = clk_prepare_enable(priv->reg_clk);
+// quick out-of-tree fix
+//		ret = clk_prepare_enable(priv->reg_clk);
 		if (ret) {
 			dev_err(dev, "unable to enable reg clk (%d)\n", ret);
 			goto err_core_clk;
