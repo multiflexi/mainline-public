@@ -198,8 +198,8 @@ static int mvebu_icu_probe(struct platform_device *pdev)
 	struct device_node *gicp_dn;
 	struct resource *res;
 	phys_addr_t setspi, clrspi;
-	u32 i, icu_int;
 	int ret;
+	u32 i;
 
 	icu = devm_kzalloc(&pdev->dev, sizeof(struct mvebu_icu),
 			   GFP_KERNEL);
@@ -257,8 +257,12 @@ static int mvebu_icu_probe(struct platform_device *pdev)
 	 * avoid unpredictable SPI assignments done by firmware.
 	 */
 	for (i = 0 ; i < ICU_MAX_IRQS ; i++) {
+		u32 icu_int, icu_grp;
+
 		icu_int = readl(icu->base + ICU_INT_CFG(i));
-		if ((icu_int >> ICU_GROUP_SHIFT) == ICU_GRP_NSR)
+		icu_grp = icu_int >> ICU_GROUP_SHIFT;
+
+		if (icu_grp == ICU_GRP_NSR)
 			writel_relaxed(0x0, icu->base + ICU_INT_CFG(i));
 	}
 
