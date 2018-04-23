@@ -4,4 +4,4 @@
 #
 obj-$(CONFIG_MVPP2) := mvpp2.o
 
-mvpp2-objs := mvpp2_main.o
+mvpp2-objs := mvpp2_main.o mvpp2_prs.o
