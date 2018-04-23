@@ -2466,3 +2466,18 @@ int mvpp2_prs_mac_da_accept_list(struct mvpp2_port *port,
 	return 0;
 }
 
+int mvpp2_prs_hits(struct mvpp2 *priv, int index)                              
+{                                                                              
+	u32 val;                                                                
+
+	if (index > MVPP2_PRS_TCAM_SRAM_SIZE)                                   
+		return -EINVAL;                                                 
+
+	mvpp2_write(priv, MVPP2_PRS_TCAM_HIT_IDX_REG, index);                   
+
+	val = mvpp2_read(priv, MVPP2_PRS_TCAM_HIT_CNT_REG);                     
+
+	val &= MVPP2_PRS_TCAM_HIT_CNT_MASK;                                     
+
+	return val;                                                             
+} 

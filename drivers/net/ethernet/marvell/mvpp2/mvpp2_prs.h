@@ -366,6 +366,9 @@ void mvpp2_prs_vid_enable_filtering(struct mvpp2_port *port);
 
 void mvpp2_prs_vid_disable_filtering(struct mvpp2_port *port);
 
+/* Hit counter */
+int mvpp2_prs_hits(struct mvpp2 *priv, int index);
+
 /* Parser initialisation */
 int mvpp2_prs_default_init(struct platform_device *pdev, struct mvpp2 *priv);
 
