@@ -6074,7 +6074,8 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
 		txq_pcpu->tso_headers = NULL;
 
 		txq_pcpu->stop_threshold = txq->size - MVPP2_MAX_SKB_DESCS;
-		txq_pcpu->wake_threshold = txq_pcpu->stop_threshold / 2;
+		txq_pcpu->wake_threshold =
+			txq_pcpu->stop_threshold - MVPP2_MAX_SKB_DESCS / 2;
 
 		txq_pcpu->tso_headers =
 			dma_alloc_coherent(port->dev->dev.parent,
