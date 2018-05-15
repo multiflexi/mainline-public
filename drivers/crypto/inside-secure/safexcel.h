@@ -11,7 +11,9 @@
 #ifndef __SAFEXCEL_H__
 #define __SAFEXCEL_H__
 
+#include <crypto/aead.h>
 #include <crypto/algapi.h>
+#include <crypto/sha.h>
 #include <crypto/internal/hash.h>
 #include <crypto/skcipher.h>
 
@@ -20,7 +22,7 @@
 
 /* Static configuration */
 #define EIP197_DEFAULT_RING_SIZE		400
-#define EIP197_MAX_TOKENS			5
+#define EIP197_MAX_TOKENS			8
 #define EIP197_MAX_RINGS			4
 #define EIP197_FETCH_COUNT			1
 #define EIP197_MAX_BATCH_SZ			64
@@ -274,7 +276,7 @@ struct safexcel_context_record {
 	u32 control0;
 	u32 control1;
 
-	__le32 data[12];
+	__le32 data[40];
 } __packed;
 
 /* control0 */
@@ -286,8 +288,8 @@ struct safexcel_context_record {
 #define CONTEXT_CONTROL_TYPE_CRYPTO_IN		0x5
 #define CONTEXT_CONTROL_TYPE_ENCRYPT_HASH_OUT	0x6
 #define CONTEXT_CONTROL_TYPE_DECRYPT_HASH_IN	0x7
-#define CONTEXT_CONTROL_TYPE_HASH_ENCRYPT_OUT	0x14
-#define CONTEXT_CONTROL_TYPE_HASH_DECRYPT_OUT	0x15
+#define CONTEXT_CONTROL_TYPE_HASH_ENCRYPT_OUT	0xe
+#define CONTEXT_CONTROL_TYPE_HASH_DECRYPT_IN	0xf
 #define CONTEXT_CONTROL_RESTART_HASH		BIT(4)
 #define CONTEXT_CONTROL_NO_FINISH_HASH		BIT(5)
 #define CONTEXT_CONTROL_SIZE(n)			((n) << 8)
@@ -300,6 +302,8 @@ struct safexcel_context_record {
 #define CONTEXT_CONTROL_CRYPTO_ALG_SHA1		(0x2 << 23)
 #define CONTEXT_CONTROL_CRYPTO_ALG_SHA224	(0x4 << 23)
 #define CONTEXT_CONTROL_CRYPTO_ALG_SHA256	(0x3 << 23)
+#define CONTEXT_CONTROL_CRYPTO_ALG_SHA384	(0x6 << 23)
+#define CONTEXT_CONTROL_CRYPTO_ALG_SHA512	(0x5 << 23)
 #define CONTEXT_CONTROL_INV_FR			(0x5 << 24)
 #define CONTEXT_CONTROL_INV_TR			(0x6 << 24)
 
@@ -313,6 +317,11 @@ struct safexcel_context_record {
 #define CONTEXT_CONTROL_DIGEST_CNT		BIT(9)
 #define CONTEXT_CONTROL_COUNTER_MODE		BIT(10)
 #define CONTEXT_CONTROL_HASH_STORE		BIT(19)
+
+/* The hash counter given to the engine in the context has a granularity of
+ * 64 bits.
+ */
+#define EIP197_COUNTER_BLOCK_SIZE		64
 
 /* EIP197_CS_RAM_CTRL */
 #define EIP197_TRC_ENABLE_0			BIT(4)
@@ -391,11 +400,15 @@ struct safexcel_token {
 	u8 opcode:4;
 } __packed;
 
+#define EIP197_TOKEN_HASH_RESULT_VERIFY		BIT(16)
+
 #define EIP197_TOKEN_STAT_LAST_HASH		BIT(0)
 #define EIP197_TOKEN_STAT_LAST_PACKET		BIT(1)
 #define EIP197_TOKEN_OPCODE_DIRECTION		0x0
 #define EIP197_TOKEN_OPCODE_INSERT		0x2
 #define EIP197_TOKEN_OPCODE_NOOP		EIP197_TOKEN_OPCODE_INSERT
+#define EIP197_TOKEN_OPCODE_RETRIEVE		0x4
+#define EIP197_TOKEN_OPCODE_VERIFY		0xd
 #define EIP197_TOKEN_OPCODE_BYPASS		GENMASK(3, 0)
 
 static inline void eip197_noop_token(struct safexcel_token *token)
@@ -479,6 +492,7 @@ struct safexcel_ring {
 
 enum safexcel_alg_type {
 	SAFEXCEL_ALG_TYPE_SKCIPHER,
+	SAFEXCEL_ALG_TYPE_AEAD,
 	SAFEXCEL_ALG_TYPE_AHASH,
 };
 
@@ -581,6 +595,16 @@ struct safexcel_context {
 	bool exit_inv;
 };
 
+struct safexcel_ahash_export_state {
+        u64 len[2];
+        u64 processed[2];
+
+	u32 digest;
+
+        u32 state[SHA512_DIGEST_SIZE / sizeof(u32)];
+        u8 cache[SHA512_BLOCK_SIZE];
+};
+
 /*
  * Template structure to describe the algorithms in order to register them.
  * It also has the purpose to contain our private structure and is actually
@@ -591,6 +615,7 @@ struct safexcel_alg_template {
 	enum safexcel_alg_type type;
 	union {
 		struct skcipher_alg skcipher;
+		struct aead_alg aead;
 		struct ahash_alg ahash;
 	} alg;
 };
@@ -625,6 +650,8 @@ struct safexcel_result_desc *safexcel_add_rdesc(struct safexcel_crypto_priv *pri
 						bool first, bool last,
 						dma_addr_t data, u32 len);
 void safexcel_inv_complete(struct crypto_async_request *req, int error);
+int safexcel_hmac_setkey(const char *alg, const u8 *key, unsigned int keylen,
+			 void *istate, void *ostate);
 
 /* available algorithms */
 extern struct safexcel_alg_template safexcel_alg_ecb_aes;
@@ -632,8 +659,17 @@ extern struct safexcel_alg_template safexcel_alg_cbc_aes;
 extern struct safexcel_alg_template safexcel_alg_sha1;
 extern struct safexcel_alg_template safexcel_alg_sha224;
 extern struct safexcel_alg_template safexcel_alg_sha256;
+extern struct safexcel_alg_template safexcel_alg_sha384;
+extern struct safexcel_alg_template safexcel_alg_sha512;
 extern struct safexcel_alg_template safexcel_alg_hmac_sha1;
 extern struct safexcel_alg_template safexcel_alg_hmac_sha224;
 extern struct safexcel_alg_template safexcel_alg_hmac_sha256;
+extern struct safexcel_alg_template safexcel_alg_hmac_sha384;
+extern struct safexcel_alg_template safexcel_alg_hmac_sha512;
+extern struct safexcel_alg_template safexcel_alg_authenc_hmac_sha1_cbc_aes;
+extern struct safexcel_alg_template safexcel_alg_authenc_hmac_sha224_cbc_aes;
+extern struct safexcel_alg_template safexcel_alg_authenc_hmac_sha256_cbc_aes;
+extern struct safexcel_alg_template safexcel_alg_authenc_hmac_sha384_cbc_aes;
+extern struct safexcel_alg_template safexcel_alg_authenc_hmac_sha512_cbc_aes;
 
 #endif

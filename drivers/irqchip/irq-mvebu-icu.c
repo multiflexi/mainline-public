@@ -18,16 +18,23 @@
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
+#include <linux/mfd/syscon.h>
 
 #include <dt-bindings/interrupt-controller/mvebu-icu.h>
 
 #include "irq-mvebu-gicp.h"
+#include "irq-mvebu-sei.h"
 
 /* ICU registers */
 #define ICU_SETSPI_NSR_AL	0x10
 #define ICU_SETSPI_NSR_AH	0x14
 #define ICU_CLRSPI_NSR_AL	0x18
 #define ICU_CLRSPI_NSR_AH	0x1c
+#define ICU_SET_SEI_AL		0x50
+#define ICU_SET_SEI_AH		0x54
+#define ICU_CLR_SEI_AL		0x58
+#define ICU_CLR_SEI_AH		0x5C
 #define ICU_INT_CFG(x)          (0x100 + 4 * (x))
 #define   ICU_INT_ENABLE	BIT(24)
 #define   ICU_IS_EDGE		BIT(28)
@@ -38,11 +45,29 @@
 #define ICU_SATA0_ICU_ID	109
 #define ICU_SATA1_ICU_ID	107
 
+struct mvebu_icu_subset_data {
+	int (*get_doorbells)(struct device_node *msi_parent_dn,
+			     phys_addr_t *set, phys_addr_t *clr);
+	unsigned int offset_set_ah;
+	unsigned int offset_set_al;
+	unsigned int offset_clr_ah;
+	unsigned int offset_clr_al;
+	unsigned int icu_group;
+};
+
 struct mvebu_icu {
 	struct irq_chip irq_chip;
-	void __iomem *base;
-	struct irq_domain *domain;
+	struct regmap *regmap;
 	struct device *dev;
+	bool legacy_bindings;
+	/* Lock on interrupt allocations/releases */
+	spinlock_t msi_lock;
+	DECLARE_BITMAP(msi_bitmap, ICU_MAX_IRQS);
+};
+
+struct mvebu_icu_msi_data {
+	struct mvebu_icu *icu;
+	const struct mvebu_icu_subset_data *subset_data;
 };
 
 struct mvebu_icu_irq_data {
@@ -50,6 +75,27 @@ struct mvebu_icu_irq_data {
 	unsigned int icu_group;
 	unsigned int type;
 };
+
+static struct mvebu_icu *mvebu_dev_get_drvdata(struct platform_device *pdev)
+{
+	struct mvebu_icu *icu;
+
+	icu = dev_get_drvdata(&pdev->dev);
+	if (icu) {
+		/* Legacy bindings: get the device data */
+		if (!icu->legacy_bindings)
+			return ERR_PTR(-EINVAL);
+	} else {
+		/* New bindings: get the parent device (ICU) data */
+		icu = dev_get_drvdata(pdev->dev.parent);
+		if (!icu)
+			return ERR_PTR(-ENODEV);
+		if (icu->legacy_bindings)
+			return ERR_PTR(-EINVAL);
+	}
+
+	return icu;
+}
 
 static void mvebu_icu_write_msg(struct msi_desc *desc, struct msi_msg *msg)
 {
@@ -69,7 +115,7 @@ static void mvebu_icu_write_msg(struct msi_desc *desc, struct msi_msg *msg)
 		icu_int = 0;
 	}
 
-	writel_relaxed(icu_int, icu->base + ICU_INT_CFG(d->hwirq));
+	regmap_write(icu->regmap, ICU_INT_CFG(d->hwirq), icu_int);
 
 	/*
 	 * The SATA unit has 2 ports, and a dedicated ICU entry per
@@ -81,10 +127,10 @@ static void mvebu_icu_write_msg(struct msi_desc *desc, struct msi_msg *msg)
 	 * configured (regardless of which port is actually in use).
 	 */
 	if (d->hwirq == ICU_SATA0_ICU_ID || d->hwirq == ICU_SATA1_ICU_ID) {
-		writel_relaxed(icu_int,
-			       icu->base + ICU_INT_CFG(ICU_SATA0_ICU_ID));
-		writel_relaxed(icu_int,
-			       icu->base + ICU_INT_CFG(ICU_SATA1_ICU_ID));
+		regmap_write(icu->regmap, ICU_INT_CFG(ICU_SATA0_ICU_ID),
+			     icu_int);
+		regmap_write(icu->regmap, ICU_INT_CFG(ICU_SATA1_ICU_ID),
+			     icu_int);
 	}
 }
 
@@ -92,32 +138,37 @@ static int
 mvebu_icu_irq_domain_translate(struct irq_domain *d, struct irq_fwspec *fwspec,
 			       unsigned long *hwirq, unsigned int *type)
 {
-	struct mvebu_icu *icu = d->host_data;
-	unsigned int icu_group;
+	struct mvebu_icu_msi_data *msi_data = platform_msi_get_host_data(d);
+	struct mvebu_icu *icu = msi_data->icu;
+	unsigned int param_count = icu->legacy_bindings ? 3 : 2;
 
 	/* Check the count of the parameters in dt */
-	if (WARN_ON(fwspec->param_count < 3)) {
+	if (WARN_ON(fwspec->param_count != param_count)) {
 		dev_err(icu->dev, "wrong ICU parameter count %d\n",
 			fwspec->param_count);
 		return -EINVAL;
 	}
 
-	/* Only ICU group type is handled */
-	icu_group = fwspec->param[0];
-	if (icu_group != ICU_GRP_NSR && icu_group != ICU_GRP_SR &&
-	    icu_group != ICU_GRP_SEI && icu_group != ICU_GRP_REI) {
-		dev_err(icu->dev, "wrong ICU group type %x\n", icu_group);
-		return -EINVAL;
+	if (icu->legacy_bindings) {
+		*hwirq = fwspec->param[1];
+		*type = fwspec->param[2];
+		if (fwspec->param[0] != ICU_GRP_NSR) {
+			dev_err(icu->dev, "wrong ICU group type %x\n",
+				fwspec->param[0]);
+			return -EINVAL;
+		}
+	} else {
+		*hwirq = fwspec->param[0];
+		*type = fwspec->param[1];
 	}
 
-	*hwirq = fwspec->param[1];
 	if (*hwirq >= ICU_MAX_IRQS) {
 		dev_err(icu->dev, "invalid interrupt number %ld\n", *hwirq);
 		return -EINVAL;
 	}
 
 	/* Mask the type to prevent wrong DT configuration */
-	*type = fwspec->param[2] & IRQ_TYPE_SENSE_MASK;
+	*type &= IRQ_TYPE_SENSE_MASK;
 
 	return 0;
 }
@@ -129,7 +180,9 @@ mvebu_icu_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
 	int err;
 	unsigned long hwirq;
 	struct irq_fwspec *fwspec = args;
-	struct mvebu_icu *icu = platform_msi_get_host_data(domain);
+	struct mvebu_icu_msi_data *msi_data =
+		platform_msi_get_host_data(domain);
+	struct mvebu_icu *icu = msi_data->icu;
 	struct mvebu_icu_irq_data *icu_irqd;
 
 	icu_irqd = kmalloc(sizeof(*icu_irqd), GFP_KERNEL);
@@ -143,13 +196,22 @@ mvebu_icu_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
 		goto free_irqd;
 	}
 
-	icu_irqd->icu_group = fwspec->param[0];
+	spin_lock(&icu->msi_lock);
+	err = bitmap_allocate_region(icu->msi_bitmap, hwirq, 0);
+	spin_unlock(&icu->msi_lock);
+	if (err < 0)
+		goto free_irqd;
+
+	if (icu->legacy_bindings)
+		icu_irqd->icu_group = fwspec->param[0];
+	else
+		icu_irqd->icu_group = msi_data->subset_data->icu_group;
 	icu_irqd->icu = icu;
 
 	err = platform_msi_domain_alloc(domain, virq, nr_irqs);
 	if (err) {
 		dev_err(icu->dev, "failed to allocate ICU interrupt in parent domain\n");
-		goto free_irqd;
+		goto free_bitmap;
 	}
 
 	/* Make sure there is no interrupt left pending by the firmware */
@@ -168,6 +230,10 @@ mvebu_icu_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
 
 free_msi:
 	platform_msi_domain_free(domain, virq, nr_irqs);
+free_bitmap:
+	spin_lock(&icu->msi_lock);
+	bitmap_release_region(icu->msi_bitmap, hwirq, 0);
+	spin_unlock(&icu->msi_lock);
 free_irqd:
 	kfree(icu_irqd);
 	return err;
@@ -177,12 +243,19 @@ static void
 mvebu_icu_irq_domain_free(struct irq_domain *domain, unsigned int virq,
 			  unsigned int nr_irqs)
 {
+	struct mvebu_icu_msi_data *msi_data =
+		platform_msi_get_host_data(domain);
+	struct mvebu_icu *icu = msi_data->icu;
 	struct irq_data *d = irq_get_irq_data(virq);
 	struct mvebu_icu_irq_data *icu_irqd = d->chip_data;
 
 	kfree(icu_irqd);
 
 	platform_msi_domain_free(domain, virq, nr_irqs);
+
+	spin_lock(&icu->msi_lock);
+	bitmap_release_region(icu->msi_bitmap, d->hwirq, 0);
+	spin_unlock(&icu->msi_lock);
 }
 
 static const struct irq_domain_ops mvebu_icu_domain_ops = {
@@ -191,15 +264,108 @@ static const struct irq_domain_ops mvebu_icu_domain_ops = {
 	.free      = mvebu_icu_irq_domain_free,
 };
 
+static int mvebu_icu_subset_probe(struct platform_device *pdev)
+{
+	const struct mvebu_icu_subset_data *subset;
+	struct mvebu_icu_msi_data *msi_data;
+	struct device_node *msi_parent_dn;
+	struct irq_domain *irq_domain;
+	struct mvebu_icu *icu;
+	phys_addr_t set, clr;
+	int ret;
+
+	msi_data = devm_kzalloc(&pdev->dev, sizeof(*msi_data), GFP_KERNEL);
+	if (!msi_data)
+		return -ENOMEM;
+
+	icu = mvebu_dev_get_drvdata(pdev);
+	if (IS_ERR(icu))
+		return PTR_ERR(icu);
+
+	subset = of_device_get_match_data(&pdev->dev);
+	if (!subset) {
+		dev_err(&pdev->dev, "Could not retrieve subset data\n");
+		return -EINVAL;
+	}
+
+	msi_data->icu = icu;
+	msi_data->subset_data = subset;
+
+	pdev->dev.msi_domain = of_msi_get_domain(&pdev->dev, pdev->dev.of_node,
+						 DOMAIN_BUS_PLATFORM_MSI);
+	if (!pdev->dev.msi_domain)
+		return -EPROBE_DEFER;
+
+	msi_parent_dn = irq_domain_get_of_node(pdev->dev.msi_domain);
+	if (!msi_parent_dn)
+		return -ENODEV;
+
+	/* Set Clear/Set ICU NSR SPI message address in AP */
+	ret = subset->get_doorbells(msi_parent_dn, &set, &clr);
+	if (ret)
+		return ret;
+
+	regmap_write(icu->regmap, subset->offset_set_ah, upper_32_bits(set));
+	regmap_write(icu->regmap, subset->offset_set_al, lower_32_bits(set));
+	regmap_write(icu->regmap, subset->offset_clr_ah, upper_32_bits(clr));
+	regmap_write(icu->regmap, subset->offset_clr_al, lower_32_bits(clr));
+
+	irq_domain = platform_msi_create_device_domain(&pdev->dev, ICU_MAX_IRQS,
+						       mvebu_icu_write_msg,
+						       &mvebu_icu_domain_ops,
+						       msi_data);
+	if (!irq_domain) {
+		dev_err(&pdev->dev, "Failed to create ICU MSI domain\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static const struct mvebu_icu_subset_data mvebu_icu_nsr_subset_data = {
+	.get_doorbells = mvebu_gicp_get_doorbells,
+	.offset_set_ah = ICU_SETSPI_NSR_AH,
+	.offset_set_al = ICU_SETSPI_NSR_AL,
+	.offset_clr_ah = ICU_CLRSPI_NSR_AH,
+	.offset_clr_al = ICU_CLRSPI_NSR_AL,
+	.icu_group = ICU_GRP_NSR,
+};
+
+static const struct mvebu_icu_subset_data mvebu_icu_sei_subset_data = {
+	.get_doorbells = mvebu_sei_get_doorbells,
+	.offset_set_ah = ICU_SET_SEI_AH,
+	.offset_set_al = ICU_SET_SEI_AL,
+	.offset_clr_ah = ICU_CLR_SEI_AH,
+	.offset_clr_al = ICU_CLR_SEI_AL,
+	.icu_group = ICU_GRP_SEI,
+};
+
+static const struct of_device_id mvebu_icu_subset_of_match[] = {
+	{
+		.compatible = "marvell,cp110-icu-nsr",
+		.data = &mvebu_icu_nsr_subset_data,
+	},
+	{
+		.compatible = "marvell,cp110-icu-sei",
+		.data = &mvebu_icu_sei_subset_data,
+	},
+	{},
+};
+
+static struct platform_driver mvebu_icu_subset_drivers = {
+	.probe  = mvebu_icu_subset_probe,
+	.driver = {
+		.name = "mvebu-icu-subset",
+		.of_match_table = mvebu_icu_subset_of_match,
+	},
+};
+builtin_platform_driver(mvebu_icu_subset_drivers);
+
 static int mvebu_icu_probe(struct platform_device *pdev)
 {
 	struct mvebu_icu *icu;
-	struct device_node *node = pdev->dev.of_node;
-	struct device_node *gicp_dn;
 	struct resource *res;
-	phys_addr_t setspi, clrspi;
-	u32 i, icu_int;
-	int ret;
+	u32 i;
 
 	icu = devm_kzalloc(&pdev->dev, sizeof(struct mvebu_icu),
 			   GFP_KERNEL);
@@ -208,18 +374,30 @@ static int mvebu_icu_probe(struct platform_device *pdev)
 
 	icu->dev = &pdev->dev;
 
+	spin_lock_init(&icu->msi_lock);
+
+	icu->regmap = syscon_regmap_lookup_by_phandle(pdev->dev.of_node, NULL);
+	if (IS_ERR(icu->regmap))
+		return PTR_ERR(icu->regmap);
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	icu->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(icu->base)) {
-		dev_err(&pdev->dev, "Failed to map icu base address.\n");
-		return PTR_ERR(icu->base);
-	}
+	if (!res)
+		return -ENODEV;
 
 	icu->irq_chip.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
 					    "ICU.%x",
 					    (unsigned int)res->start);
 	if (!icu->irq_chip.name)
 		return -ENOMEM;
+
+	/*
+	 * Legacy bindings: ICU is one node with one MSI parent: force manually
+	 *                  the probe of the NSR interrupts side.
+	 * New bindings: ICU node has children, one per interrupt controller
+	 *               having its own MSI parent: call platform_populate().
+	 */
+	if (!of_get_child_count(pdev->dev.of_node))
+		icu->legacy_bindings = true;
 
 	icu->irq_chip.irq_mask = irq_chip_mask_parent;
 	icu->irq_chip.irq_unmask = irq_chip_unmask_parent;
@@ -230,52 +408,32 @@ static int mvebu_icu_probe(struct platform_device *pdev)
 #endif
 
 	/*
-	 * We're probed after MSI domains have been resolved, so force
-	 * resolution here.
-	 */
-	pdev->dev.msi_domain = of_msi_get_domain(&pdev->dev, node,
-						 DOMAIN_BUS_PLATFORM_MSI);
-	if (!pdev->dev.msi_domain)
-		return -EPROBE_DEFER;
-
-	gicp_dn = irq_domain_get_of_node(pdev->dev.msi_domain);
-	if (!gicp_dn)
-		return -ENODEV;
-
-	ret = mvebu_gicp_get_doorbells(gicp_dn, &setspi, &clrspi);
-	if (ret)
-		return ret;
-
-	/* Set Clear/Set ICU SPI message address in AP */
-	writel_relaxed(upper_32_bits(setspi), icu->base + ICU_SETSPI_NSR_AH);
-	writel_relaxed(lower_32_bits(setspi), icu->base + ICU_SETSPI_NSR_AL);
-	writel_relaxed(upper_32_bits(clrspi), icu->base + ICU_CLRSPI_NSR_AH);
-	writel_relaxed(lower_32_bits(clrspi), icu->base + ICU_CLRSPI_NSR_AL);
-
-	/*
-	 * Clean all ICU interrupts with type SPI_NSR, required to
+	 * Clean all ICU interrupts of type SPI_NSR and SEI, required to
 	 * avoid unpredictable SPI assignments done by firmware.
 	 */
 	for (i = 0 ; i < ICU_MAX_IRQS ; i++) {
-		icu_int = readl(icu->base + ICU_INT_CFG(i));
-		if ((icu_int >> ICU_GROUP_SHIFT) == ICU_GRP_NSR)
-			writel_relaxed(0x0, icu->base + ICU_INT_CFG(i));
+		u32 icu_int, icu_grp;
+
+		regmap_read(icu->regmap, ICU_INT_CFG(i), &icu_int);
+		icu_grp = icu_int >> ICU_GROUP_SHIFT;
+
+		if (icu_grp == ICU_GRP_NSR ||
+		    (icu_grp == ICU_GRP_SEI && !icu->legacy_bindings))
+			regmap_write(icu->regmap, ICU_INT_CFG(i), 0);
 	}
 
-	icu->domain =
-		platform_msi_create_device_domain(&pdev->dev, ICU_MAX_IRQS,
-						  mvebu_icu_write_msg,
-						  &mvebu_icu_domain_ops, icu);
-	if (!icu->domain) {
-		dev_err(&pdev->dev, "Failed to create ICU domain\n");
-		return -ENOMEM;
-	}
+	platform_set_drvdata(pdev, icu);
 
-	return 0;
+	if (icu->legacy_bindings)
+		return mvebu_icu_subset_probe(pdev);
+	else
+		return devm_of_platform_populate(&pdev->dev);
 }
 
 static const struct of_device_id mvebu_icu_of_match[] = {
-	{ .compatible = "marvell,cp110-icu", },
+	{
+		.compatible = "marvell,cp110-icu",
+	},
 	{},
 };
 

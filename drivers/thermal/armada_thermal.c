@@ -24,6 +24,14 @@
 #include <linux/of_device.h>
 #include <linux/thermal.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
+#include <linux/mfd/syscon.h>
+#include <linux/regmap.h>
+#include <linux/workqueue.h>
+
+#include "thermal_core.h"
+
+#define TO_MCELSIUS(c)			(c * 1000)
 
 /* Thermal Manager Control and Status Register */
 #define PMU_TDC0_SW_RST_MASK		(0x1 << 1)
@@ -39,47 +47,57 @@
 #define A375_READOUT_INVERT		BIT(15)
 #define A375_HW_RESETn			BIT(8)
 
-/* Legacy bindings */
-#define LEGACY_CONTROL_MEM_LEN		0x4
-
-/* Current bindings with the 2 control registers under the same memory area */
-#define LEGACY_CONTROL1_OFFSET		0x0
-#define CONTROL0_OFFSET			0x0
-#define CONTROL1_OFFSET			0x4
-
 /* Errata fields */
 #define CONTROL0_TSEN_TC_TRIM_MASK	0x7
 #define CONTROL0_TSEN_TC_TRIM_VAL	0x3
 
-/* TSEN refers to the temperature sensors within the AP */
 #define CONTROL0_TSEN_START		BIT(0)
 #define CONTROL0_TSEN_RESET		BIT(1)
 #define CONTROL0_TSEN_ENABLE		BIT(2)
+#define CONTROL0_TSEN_AVG_BYPASS	BIT(6)
+#define CONTROL0_TSEN_CHAN_SHIFT	13
+#define CONTROL0_TSEN_CHAN_MASK		0xF
+#define CONTROL0_TSEN_OSR_SHIFT		24
+#define CONTROL0_TSEN_OSR_MAX		0x3
+#define CONTROL0_TSEN_MODE_SHIFT	30
+#define CONTROL0_TSEN_MODE_EXTERNAL	0x2
+#define CONTROL0_TSEN_MODE_MASK		0x3
 
-/* EXT_TSEN refers to the external temperature sensors, out of the AP */
+#define CONTROL1_TSEN_AVG_SHIFT		0
+#define CONTROL1_TSEN_AVG_MASK		0x7
 #define CONTROL1_EXT_TSEN_SW_RESET	BIT(7)
 #define CONTROL1_EXT_TSEN_HW_RESETn	BIT(8)
+#define CONTROL1_TSEN_INT_EN		BIT(25)
+#define CONTROL1_TSEN_SELECT_OFF	21
+#define CONTROL1_TSEN_SELECT_MASK	0x3
 
 #define STATUS_POLL_PERIOD_US		1000
 #define STATUS_POLL_TIMEOUT_US		100000
+#define OVERHEAT_INT_POLL_DELAY		(1 * HZ)
 
 struct armada_thermal_data;
 
 /* Marvell EBU Thermal Sensor Dev Structure */
 struct armada_thermal_priv {
-	void __iomem *status;
-	void __iomem *control0;
-	void __iomem *control1;
+	struct device *dev;
+	struct regmap *syscon;
+	char zone_name[THERMAL_NAME_LENGTH];
+	struct mutex update_lock;
+	struct thermal_zone_device *overheat_sensor;
 	struct armada_thermal_data *data;
+	int current_channel;
+	struct delayed_work wait_end_overheat_work;
+	bool overheat_int_enabled;
+	long current_threshold;
+	long current_hysteresis;
+	bool overheat_situation;
+	int interrupt_source;
 };
 
 struct armada_thermal_data {
-	/* Initialize the sensor */
-	void (*init_sensor)(struct platform_device *pdev,
-			    struct armada_thermal_priv *);
-
-	/* Test for a valid sensor value (optional) */
-	bool (*is_valid)(struct armada_thermal_priv *);
+	/* Initialize the thermal IC */
+	void (*init)(struct platform_device *pdev,
+		     struct armada_thermal_priv *priv);
 
 	/* Formula coeficients: temp = (b - m * reg) / div */
 	s64 coef_b;
@@ -91,142 +109,303 @@ struct armada_thermal_data {
 	/* Register shift and mask to access the sensor temperature */
 	unsigned int temp_shift;
 	unsigned int temp_mask;
+	unsigned int thresh_shift;
+	unsigned int hyst_shift;
+	unsigned int hyst_mask;
 	u32 is_valid_bit;
-	bool needs_control0;
+
+	/* Syscon access */
+	unsigned int syscon_control0_off;
+	unsigned int syscon_control1_off;
+	unsigned int syscon_status_off;
+	unsigned int dfx_irq_cause_off;
+	unsigned int dfx_irq_mask_off;
+	unsigned int dfx_overheat_irq;
+	unsigned int dfx_server_irq_mask_off;
+	unsigned int dfx_server_irq_en;
+
+	/* One sensor is in the thermal IC, the others are in the CPUs if any */
+	unsigned int cpu_nr;
 };
 
-static void armadaxp_init_sensor(struct platform_device *pdev,
-				 struct armada_thermal_priv *priv)
+struct armada_drvdata {
+	enum drvtype {
+		LEGACY,
+		SYSCON
+	} type;
+	union {
+		struct armada_thermal_priv *priv;
+		struct thermal_zone_device *tz;
+	} data;
+};
+
+/*
+ * struct armada_thermal_sensor - hold the information of one thermal sensor
+ * @thermal: pointer to the local private structure
+ * @tzd: pointer to the thermal zone device
+ * @id: identifier of the thermal sensor
+ */
+struct armada_thermal_sensor {
+	struct armada_thermal_priv *priv;
+	int id;
+};
+
+struct armada_thermal_priv *work_to_thermal(struct work_struct *work)
 {
-	u32 reg;
-
-	reg = readl_relaxed(priv->control1);
-	reg |= PMU_TDC0_OTF_CAL_MASK;
-	writel(reg, priv->control1);
-
-	/* Reference calibration value */
-	reg &= ~PMU_TDC0_REF_CAL_CNT_MASK;
-	reg |= (0xf1 << PMU_TDC0_REF_CAL_CNT_OFFS);
-	writel(reg, priv->control1);
-
-	/* Reset the sensor */
-	reg = readl_relaxed(priv->control1);
-	writel((reg | PMU_TDC0_SW_RST_MASK), priv->control1);
-
-	writel(reg, priv->control1);
-
-	/* Enable the sensor */
-	reg = readl_relaxed(priv->status);
-	reg &= ~PMU_TM_DISABLE_MASK;
-	writel(reg, priv->status);
+	return container_of(work, struct armada_thermal_priv,
+			    wait_end_overheat_work.work);
 }
 
-static void armada370_init_sensor(struct platform_device *pdev,
-				  struct armada_thermal_priv *priv)
+static void armadaxp_init(struct platform_device *pdev,
+			  struct armada_thermal_priv *priv)
 {
+	struct armada_thermal_data *data = priv->data;
 	u32 reg;
 
-	reg = readl_relaxed(priv->control1);
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
 	reg |= PMU_TDC0_OTF_CAL_MASK;
-	writel(reg, priv->control1);
 
 	/* Reference calibration value */
 	reg &= ~PMU_TDC0_REF_CAL_CNT_MASK;
 	reg |= (0xf1 << PMU_TDC0_REF_CAL_CNT_OFFS);
-	writel(reg, priv->control1);
 
+	/* Reset the sensor */
+	reg |= PMU_TDC0_SW_RST_MASK;
+
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
+
+	/* Enable the sensor */
+	regmap_read(priv->syscon, data->syscon_status_off, &reg);
+	reg &= ~PMU_TM_DISABLE_MASK;
+	regmap_write(priv->syscon, data->syscon_status_off, reg);
+}
+
+static void armada370_init(struct platform_device *pdev,
+			   struct armada_thermal_priv *priv)
+{
+	struct armada_thermal_data *data = priv->data;
+	u32 reg;
+
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
+	reg |= PMU_TDC0_OTF_CAL_MASK;
+
+	/* Reference calibration value */
+	reg &= ~PMU_TDC0_REF_CAL_CNT_MASK;
+	reg |= (0xf1 << PMU_TDC0_REF_CAL_CNT_OFFS);
+
+	/* Reset the sensor */
 	reg &= ~PMU_TDC0_START_CAL_MASK;
-	writel(reg, priv->control1);
+
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
 
 	msleep(10);
 }
 
-static void armada375_init_sensor(struct platform_device *pdev,
-				  struct armada_thermal_priv *priv)
+static void armada375_init(struct platform_device *pdev,
+			   struct armada_thermal_priv *priv)
 {
+	struct armada_thermal_data *data = priv->data;
 	u32 reg;
 
-	reg = readl(priv->control1);
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
 	reg &= ~(A375_UNIT_CONTROL_MASK << A375_UNIT_CONTROL_SHIFT);
 	reg &= ~A375_READOUT_INVERT;
 	reg &= ~A375_HW_RESETn;
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
 
-	writel(reg, priv->control1);
 	msleep(20);
 
 	reg |= A375_HW_RESETn;
-	writel(reg, priv->control1);
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
+
 	msleep(50);
 }
 
-static void armada_wait_sensor_validity(struct armada_thermal_priv *priv)
+static int armada_wait_sensor_validity(struct armada_thermal_priv *priv)
 {
 	u32 reg;
 
-	readl_relaxed_poll_timeout(priv->status, reg,
-				   reg & priv->data->is_valid_bit,
-				   STATUS_POLL_PERIOD_US,
-				   STATUS_POLL_TIMEOUT_US);
+	return regmap_read_poll_timeout(priv->syscon,
+					priv->data->syscon_status_off, reg,
+					reg & priv->data->is_valid_bit,
+					STATUS_POLL_PERIOD_US,
+					STATUS_POLL_TIMEOUT_US);
 }
 
-static void armada380_init_sensor(struct platform_device *pdev,
-				  struct armada_thermal_priv *priv)
+static void armada380_init(struct platform_device *pdev,
+			   struct armada_thermal_priv *priv)
 {
-	u32 reg = readl_relaxed(priv->control1);
+	struct armada_thermal_data *data = priv->data;
+	u32 reg;
 
 	/* Disable the HW/SW reset */
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
 	reg |= CONTROL1_EXT_TSEN_HW_RESETn;
 	reg &= ~CONTROL1_EXT_TSEN_SW_RESET;
-	writel(reg, priv->control1);
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
 
 	/* Set Tsen Tc Trim to correct default value (errata #132698) */
-	if (priv->control0) {
-		reg = readl_relaxed(priv->control0);
-		reg &= ~CONTROL0_TSEN_TC_TRIM_MASK;
-		reg |= CONTROL0_TSEN_TC_TRIM_VAL;
-		writel(reg, priv->control0);
-	}
-
-	/* Wait the sensors to be valid or the core will warn the user */
-	armada_wait_sensor_validity(priv);
+	regmap_read(priv->syscon, data->syscon_control0_off, &reg);
+	reg &= ~CONTROL0_TSEN_TC_TRIM_MASK;
+	reg |= CONTROL0_TSEN_TC_TRIM_VAL;
+	regmap_write(priv->syscon, data->syscon_control0_off, reg);
 }
 
-static void armada_ap806_init_sensor(struct platform_device *pdev,
-				     struct armada_thermal_priv *priv)
+static void armada_ap806_init(struct platform_device *pdev,
+			      struct armada_thermal_priv *priv)
 {
+	struct armada_thermal_data *data = priv->data;
 	u32 reg;
 
-	reg = readl_relaxed(priv->control0);
+	regmap_read(priv->syscon, data->syscon_control0_off, &reg);
 	reg &= ~CONTROL0_TSEN_RESET;
 	reg |= CONTROL0_TSEN_START | CONTROL0_TSEN_ENABLE;
-	writel(reg, priv->control0);
 
-	/* Wait the sensors to be valid or the core will warn the user */
-	armada_wait_sensor_validity(priv);
+	/* Sample every ~2ms */
+	reg |= CONTROL0_TSEN_OSR_MAX << CONTROL0_TSEN_OSR_SHIFT;
+
+	/* Enable average (2 samples by default) */
+	reg &= ~CONTROL0_TSEN_AVG_BYPASS;
+
+	regmap_write(priv->syscon, data->syscon_control0_off, reg);
+}
+
+static void armada_cp110_init(struct platform_device *pdev,
+			      struct armada_thermal_priv *priv)
+{
+	struct armada_thermal_data *data = priv->data;
+	u32 reg;
+
+	armada380_init(pdev, priv);
+
+	/* Sample every ~2ms */
+	regmap_read(priv->syscon, data->syscon_control0_off, &reg);
+	reg |= CONTROL0_TSEN_OSR_MAX << CONTROL0_TSEN_OSR_SHIFT;
+	regmap_write(priv->syscon, data->syscon_control0_off, reg);
+
+	/* Average the output value over 2^1 = 2 samples */
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
+	reg &= ~CONTROL1_TSEN_AVG_MASK << CONTROL1_TSEN_AVG_SHIFT;
+	reg |= 1 << CONTROL1_TSEN_AVG_SHIFT;
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
 }
 
 static bool armada_is_valid(struct armada_thermal_priv *priv)
 {
-	u32 reg = readl_relaxed(priv->status);
+	u32 reg;
+
+	if (!priv->data->is_valid_bit)
+		return true;
+
+	regmap_read(priv->syscon, priv->data->syscon_status_off, &reg);
 
 	return reg & priv->data->is_valid_bit;
 }
 
-static int armada_get_temp(struct thermal_zone_device *thermal,
-			   int *temp)
+static void armada_enable_overheat_interrupt(struct armada_thermal_priv *priv)
 {
-	struct armada_thermal_priv *priv = thermal->devdata;
-	u32 reg, div;
-	s64 sample, b, m;
+	struct armada_thermal_data *data = priv->data;
+	u32 reg;
 
-	/* Valid check */
-	if (priv->data->is_valid && !priv->data->is_valid(priv)) {
-		dev_err(&thermal->device,
+	/* Clear DFX temperature IRQ cause */
+	regmap_read(priv->syscon, data->dfx_irq_cause_off, &reg);
+
+	/* Enable DFX Temperature IRQ */
+	regmap_read(priv->syscon, data->dfx_irq_mask_off, &reg);
+	reg |= data->dfx_overheat_irq;
+	regmap_write(priv->syscon, data->dfx_irq_mask_off, reg);
+
+	/* Enable DFX server IRQ */
+	regmap_read(priv->syscon, data->dfx_server_irq_mask_off, &reg);
+	reg |= data->dfx_server_irq_en;
+	regmap_write(priv->syscon, data->dfx_server_irq_mask_off, reg);
+
+	/* Enable overheat interrupt */
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
+	reg |= CONTROL1_TSEN_INT_EN;
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
+
+	priv->overheat_int_enabled = true;
+}
+
+static void armada_disable_overheat_interrupt(struct armada_thermal_priv *priv)
+{
+	struct armada_thermal_data *data = priv->data;
+	u32 reg;
+
+	regmap_read(priv->syscon, data->syscon_control1_off, &reg);
+	reg &= ~CONTROL1_TSEN_INT_EN;
+	regmap_write(priv->syscon, data->syscon_control1_off, reg);
+
+	priv->overheat_int_enabled = false;
+}
+
+/* There is currently no board with more than one sensor per channel */
+static int armada_select_channel(struct armada_thermal_priv *priv, int channel)
+{
+	struct armada_thermal_data *data = priv->data;
+	u32 ctrl0;
+
+	if (channel < 0 || channel > priv->data->cpu_nr)
+		return -EINVAL;
+
+	if (priv->current_channel == channel)
+		return 0;
+
+	/*
+	 * Changing the channel while the system is too hot could clear the
+	 * overheat state by changing the source while the temperature is still
+	 * very high. Forbid any channel change in this situation.
+	 */
+	if (priv->overheat_situation)
+		return -EBUSY;
+
+	/* Stop the measurements */
+	regmap_read(priv->syscon, data->syscon_control0_off, &ctrl0);
+	ctrl0 &= ~CONTROL0_TSEN_START;
+	regmap_write(priv->syscon, data->syscon_control0_off, ctrl0);
+
+	/* Reset the mode, internal sensor will be automatically selected */
+	ctrl0 &= ~(CONTROL0_TSEN_MODE_MASK << CONTROL0_TSEN_MODE_SHIFT);
+
+	/* Other channels are external and should be selected accordingly */
+	if (channel) {
+		/* Change the mode to external */
+		ctrl0 |= CONTROL0_TSEN_MODE_EXTERNAL <<
+			 CONTROL0_TSEN_MODE_SHIFT;
+		/* Select the sensor */
+		ctrl0 &= ~(CONTROL0_TSEN_CHAN_MASK << CONTROL0_TSEN_CHAN_SHIFT);
+		ctrl0 |= (channel - 1) << CONTROL0_TSEN_CHAN_SHIFT;
+	}
+
+	/* Actually set the mode/channel */
+	regmap_write(priv->syscon, data->syscon_control0_off, ctrl0);
+	priv->current_channel = channel;
+
+	/* Re-start the measurements */
+	ctrl0 |= CONTROL0_TSEN_START;
+	regmap_write(priv->syscon, data->syscon_control0_off, ctrl0);
+
+	/*
+	 * The IP has a latency of ~15ms, so after updating the selected source,
+	 * we must absolutely wait for the sensor validity bit to ensure we read
+	 * actual data.
+	 */
+	if (armada_wait_sensor_validity(priv)) {
+		dev_err(priv->dev,
 			"Temperature sensor reading not valid\n");
 		return -EIO;
 	}
 
-	reg = readl_relaxed(priv->status);
+	return 0;
+}
+
+static int armada_read_sensor(struct armada_thermal_priv *priv, long *temp)
+{
+	u32 reg, div;
+	s64 sample, b, m;
+
+	regmap_read(priv->syscon, priv->data->syscon_status_off, &reg);
 	reg = (reg >> priv->data->temp_shift) & priv->data->temp_mask;
 	if (priv->data->signed_sample)
 		/* The most significant bit is the sign bit */
@@ -247,45 +426,271 @@ static int armada_get_temp(struct thermal_zone_device *thermal,
 	return 0;
 }
 
-static struct thermal_zone_device_ops ops = {
+static int armada_get_temp_legacy(struct thermal_zone_device *thermal,
+				  int *temp)
+{
+	struct armada_thermal_priv *priv = thermal->devdata;
+	long temperature;
+	int ret;
+
+	/* Valid check */
+	if (armada_is_valid(priv)) {
+		dev_err(priv->dev,
+			"Temperature sensor reading not valid\n");
+		return -EIO;
+	}
+
+	/* Do the actual reading */
+	ret = armada_read_sensor(priv, &temperature);
+	*temp = temperature;
+
+	return ret;
+}
+
+static struct thermal_zone_device_ops legacy_ops = {
+	.get_temp = armada_get_temp_legacy,
+};
+
+static int armada_get_temp(void *_sensor, int *temp)
+{
+	struct armada_thermal_sensor *sensor = _sensor;
+	struct armada_thermal_priv *priv = sensor->priv;
+	bool toggle_int = priv->overheat_int_enabled &&
+			  !priv->overheat_situation &&
+			  sensor->id != priv->interrupt_source;
+	long temperature;
+	int ret;
+
+	mutex_lock(&priv->update_lock);
+
+	/* Disable the interrupt the time to read another sensor */
+	if (toggle_int)
+		armada_disable_overheat_interrupt(priv);
+
+	/* Select the desired channel */
+	ret = armada_select_channel(priv, sensor->id);
+	if (ret)
+		goto unlock_mutex;
+
+	/* Do the actual reading */
+	ret = armada_read_sensor(priv, &temperature);
+	if (ret)
+		goto unlock_mutex;
+
+	/* Select back the interrupt source channel */
+	ret = armada_select_channel(priv, priv->interrupt_source);
+	if (ret)
+		goto unlock_mutex;
+
+	if (toggle_int)
+		armada_enable_overheat_interrupt(priv);
+
+	*temp = temperature;
+
+unlock_mutex:
+	mutex_unlock(&priv->update_lock);
+
+	return ret;
+}
+
+static struct thermal_zone_of_device_ops of_ops = {
 	.get_temp = armada_get_temp,
 };
 
+static unsigned int armada_mc_to_reg_temp(struct armada_thermal_data *data,
+					  unsigned int temp_mc)
+{
+	s64 b = data->coef_b;
+	s64 m = data->coef_m;
+	s64 div = data->coef_div;
+	unsigned int sample;
+
+	if (data->inverted)
+		sample = div_s64(((temp_mc * div) + b), m);
+	else
+		sample = div_s64((b - (temp_mc * div)), m);
+
+	return sample & data->temp_mask;
+}
+
+static unsigned int armada_mc_to_reg_hyst(struct armada_thermal_data *data,
+					  unsigned int hyst_mc)
+{
+	/*
+	 * The documentation states:
+	 * high/low watermark = threshold +/- 0.4761 * 2^(hysteresis + 2)
+	 * which is the mathematical derivation for:
+	 * 0x0 <=> 1.9°C, 0x1 <=> 3.8°C, 0x2 <=> 7.6°C, 0x3 <=> 15.2
+	 */
+	unsigned int hyst_levels_mc[] = {1900, 3800, 7600, 15200};
+	int i;
+
+	/*
+	 * We will always take the smallest possible hysteresis to avoid risking
+	 * the hardware integrity by enlarging the threshold by +8°C in the
+	 * worst case.
+	 */
+	for (i = ARRAY_SIZE(hyst_levels_mc) - 1; i > 0; i--)
+		if (hyst_mc >= hyst_levels_mc[i])
+			break;
+
+	return i & data->hyst_mask;
+}
+
+static void armada_set_overheat_thresholds(struct armada_thermal_priv *priv,
+					   int thresh_mc, int hyst_mc)
+{
+	struct armada_thermal_data *data = priv->data;
+	unsigned int threshold = armada_mc_to_reg_temp(data, thresh_mc);
+	unsigned int hysteresis = armada_mc_to_reg_hyst(data, hyst_mc);
+	u32 ctrl1;
+
+	regmap_read(priv->syscon, data->syscon_control1_off, &ctrl1);
+
+	/* Set Threshold */
+	if (thresh_mc >= 0) {
+		ctrl1 &= ~(data->temp_mask << data->thresh_shift);
+		ctrl1 |= threshold << data->thresh_shift;
+		priv->current_threshold = thresh_mc;
+	}
+
+	/* Set Hysteresis */
+	if (hyst_mc >= 0) {
+		ctrl1 &= ~(data->hyst_mask << data->hyst_shift);
+		ctrl1 |= hysteresis << data->hyst_shift;
+		priv->current_hysteresis = hyst_mc;
+	}
+
+	regmap_write(priv->syscon, data->syscon_control1_off, ctrl1);
+}
+
+static bool armada_temp_is_over_threshold(struct armada_thermal_priv *priv)
+{
+	struct armada_thermal_data *data = priv->data;
+	u32 reg;
+
+	/*
+	 * When an overheat interrupt occurs, poll DFX overheat IRQ cause
+	 * register until the right bit gets cleared.
+	 */
+	regmap_read(priv->syscon, data->dfx_irq_cause_off, &reg);
+	if (reg & data->dfx_overheat_irq) {
+		/*
+		 * Threshold reached, as different CPs may share the same
+		 * interrupt, we need to mask the overheat interrupt until the
+		 * temperature climbs down to the low-threshold, otherwise if
+		 * another CP reaches its threshold temperature too, it will
+		 * re-trigger an interrupt for the CPs that are already over
+		 * heating.
+		 */
+		regmap_read(priv->syscon, data->dfx_irq_mask_off, &reg);
+		reg &= ~data->dfx_overheat_irq;
+		regmap_write(priv->syscon, data->dfx_irq_mask_off, reg);
+
+		schedule_delayed_work(&priv->wait_end_overheat_work,
+				      OVERHEAT_INT_POLL_DELAY);
+
+		priv->overheat_situation = true;
+
+		return true;
+	}
+
+	/*
+	 * The temperature level is acceptable again, unmask the overheat
+	 * interrupt.
+	 */
+	regmap_read(priv->syscon, data->dfx_irq_mask_off, &reg);
+	reg |= data->dfx_overheat_irq;
+	regmap_write(priv->syscon, data->dfx_irq_mask_off, reg);
+
+	priv->overheat_situation = false;
+
+	/* Notify the thermal core that the temperature is acceptable again */
+	thermal_zone_device_update(priv->overheat_sensor,
+				   THERMAL_EVENT_UNSPECIFIED);
+
+	return false;
+}
+
+/*
+ * Overheat interrupt must be cleared by reading the DFX interrupt cause after
+ * the temperature has fallen down to the low threshold, otherwise future
+ * interrupts will not be served. This work polls the corresponding register
+ * until the overheat flag gets cleared.
+ */
+static void armada_wait_end_overheat(struct work_struct *work)
+{
+	armada_temp_is_over_threshold(work_to_thermal(work));
+}
+
+static irqreturn_t armada_overheat_isr(int irq, void *blob)
+{
+	struct armada_thermal_priv *priv = (struct armada_thermal_priv *)blob;
+	u32 reg;
+	long temperature;
+
+	/*
+	 * As the interrupt line is shared between CPs, this handler will be
+	 * executed each time a CP triggers an overheat interrupt. Once the
+	 * interrupt is triggered for one CP, it is masked in the DFX register
+	 * until the temperature falls under the threshold, when it is unmasked.
+	 *
+	 * Check if the interrupt is masked, in this case it means the code is
+	 * running on the wrong CP and we should return IRQ_NONE.
+	 */
+	regmap_read(priv->syscon, priv->data->dfx_irq_mask_off, &reg);
+	if (!(reg & priv->data->dfx_overheat_irq))
+		return IRQ_NONE;
+
+	if (armada_temp_is_over_threshold(priv)) {
+		armada_read_sensor(priv, &temperature);
+
+		/* Notify the core about the unexpected heat level */
+		thermal_zone_device_update(priv->overheat_sensor,
+					   THERMAL_EVENT_UNSPECIFIED);
+	}
+
+	return IRQ_HANDLED;
+}
+
 static const struct armada_thermal_data armadaxp_data = {
-	.init_sensor = armadaxp_init_sensor,
+	.init = armadaxp_init,
 	.temp_shift = 10,
 	.temp_mask = 0x1ff,
 	.coef_b = 3153000000ULL,
 	.coef_m = 10000000ULL,
 	.coef_div = 13825,
+	.syscon_status_off = 0xb0,
+	.syscon_control1_off = 0xd0,
 };
 
 static const struct armada_thermal_data armada370_data = {
-	.is_valid = armada_is_valid,
-	.init_sensor = armada370_init_sensor,
+	.init = armada370_init,
 	.is_valid_bit = BIT(9),
 	.temp_shift = 10,
 	.temp_mask = 0x1ff,
 	.coef_b = 3153000000ULL,
 	.coef_m = 10000000ULL,
 	.coef_div = 13825,
+	.syscon_status_off = 0x0,
+	.syscon_control1_off = 0x4,
 };
 
 static const struct armada_thermal_data armada375_data = {
-	.is_valid = armada_is_valid,
-	.init_sensor = armada375_init_sensor,
+	.init = armada375_init,
 	.is_valid_bit = BIT(10),
 	.temp_shift = 0,
 	.temp_mask = 0x1ff,
 	.coef_b = 3171900000ULL,
 	.coef_m = 10000000ULL,
 	.coef_div = 13616,
-	.needs_control0 = true,
+	.syscon_status_off = 0x78,
+	.syscon_control0_off = 0x7c,
+	.syscon_control1_off = 0x80,
 };
 
 static const struct armada_thermal_data armada380_data = {
-	.is_valid = armada_is_valid,
-	.init_sensor = armada380_init_sensor,
+	.init = armada380_init,
 	.is_valid_bit = BIT(10),
 	.temp_shift = 0,
 	.temp_mask = 0x3ff,
@@ -293,33 +698,55 @@ static const struct armada_thermal_data armada380_data = {
 	.coef_m = 2000096ULL,
 	.coef_div = 4201,
 	.inverted = true,
+	.syscon_control0_off = 0x70,
+	.syscon_control1_off = 0x74,
+	.syscon_status_off = 0x78,
 };
 
 static const struct armada_thermal_data armada_ap806_data = {
-	.is_valid = armada_is_valid,
-	.init_sensor = armada_ap806_init_sensor,
+	.init = armada_ap806_init,
 	.is_valid_bit = BIT(16),
 	.temp_shift = 0,
 	.temp_mask = 0x3ff,
+	.thresh_shift = 3,
+	.hyst_shift = 19,
+	.hyst_mask = 0x3,
 	.coef_b = -150000LL,
 	.coef_m = 423ULL,
 	.coef_div = 1,
 	.inverted = true,
 	.signed_sample = true,
-	.needs_control0 = true,
+	.syscon_control0_off = 0x84,
+	.syscon_control1_off = 0x88,
+	.syscon_status_off = 0x8C,
+	.dfx_irq_cause_off = 0x108,
+	.dfx_irq_mask_off = 0x10C,
+	.dfx_overheat_irq = BIT(22),
+	.dfx_server_irq_mask_off = 0x104,
+	.dfx_server_irq_en = BIT(1),
+	.cpu_nr = 4,
 };
 
 static const struct armada_thermal_data armada_cp110_data = {
-	.is_valid = armada_is_valid,
-	.init_sensor = armada380_init_sensor,
+	.init = armada_cp110_init,
 	.is_valid_bit = BIT(10),
 	.temp_shift = 0,
 	.temp_mask = 0x3ff,
+	.thresh_shift = 16,
+	.hyst_shift = 26,
+	.hyst_mask = 0x3,
 	.coef_b = 1172499100ULL,
 	.coef_m = 2000096ULL,
 	.coef_div = 4201,
 	.inverted = true,
-	.needs_control0 = true,
+	.syscon_control0_off = 0x70,
+	.syscon_control1_off = 0x74,
+	.syscon_status_off = 0x78,
+	.dfx_irq_cause_off = 0x108,
+	.dfx_irq_mask_off = 0x10C,
+	.dfx_overheat_irq = BIT(20),
+	.dfx_server_irq_mask_off = 0x104,
+	.dfx_server_irq_en = BIT(1),
 };
 
 static const struct of_device_id armada_thermal_id_table[] = {
@@ -353,13 +780,155 @@ static const struct of_device_id armada_thermal_id_table[] = {
 };
 MODULE_DEVICE_TABLE(of, armada_thermal_id_table);
 
+static const struct regmap_config armada_thermal_regmap_config = {
+	.reg_bits = 32,
+	.reg_stride = 4,
+	.val_bits = 32,
+	.fast_io = true,
+};
+
+static int armada_thermal_probe_legacy(struct platform_device *pdev,
+				       struct armada_thermal_priv *priv)
+{
+	struct armada_thermal_data *data = priv->data;
+	struct resource *res;
+	void __iomem *base;
+
+	/* First memory region points towards the status register */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (IS_ERR(res))
+		return PTR_ERR(res);
+
+	/*
+	 * Edit the resource start address and length to map over all the
+	 * registers, instead of pointing at them one by one.
+	 */
+	res->start -= data->syscon_status_off;
+	res->end = res->start + max(data->syscon_status_off,
+				    max(data->syscon_control0_off,
+					data->syscon_control1_off)) +
+		   sizeof(unsigned int) - 1;
+
+	base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(base))
+		return PTR_ERR(base);
+
+	priv->syscon = devm_regmap_init_mmio(&pdev->dev, base,
+					     &armada_thermal_regmap_config);
+	if (IS_ERR(priv->syscon))
+		return PTR_ERR(priv->syscon);
+
+	return 0;
+}
+
+static int armada_thermal_probe_syscon(struct platform_device *pdev,
+				       struct armada_thermal_priv *priv)
+{
+	int irq, ret;
+
+	priv->syscon = syscon_node_to_regmap(pdev->dev.parent->of_node);
+	if (IS_ERR(priv->syscon))
+		return PTR_ERR(priv->syscon);
+
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
+
+	/*
+	 * One SEI interrupt in the GIC can be triggered by each DFX server (one
+	 * per CP) upon hardware interrupt from the thermal IP itself.
+	 */
+	ret = devm_request_irq(&pdev->dev, irq, armada_overheat_isr, 0,
+			       NULL, priv);
+	if (ret)
+		return ret;
+
+	INIT_DELAYED_WORK(&priv->wait_end_overheat_work,
+			  armada_wait_end_overheat);
+
+	return 0;
+}
+
+static void armada_set_sane_name(struct platform_device *pdev,
+				 struct armada_thermal_priv *priv)
+{
+	const char *name = dev_name(&pdev->dev);
+	char *insane_char;
+
+	if (strlen(name) > THERMAL_NAME_LENGTH) {
+		/*
+		 * When inside a system controller, the device name has the
+		 * form: f06f8000.system-controller:ap-thermal so stripping
+		 * after the ':' should give us a shorter but meaningful name.
+		 */
+		name = strrchr(name, ':');
+		if (!name)
+			name = "armada_thermal";
+		else
+			name++;
+	}
+
+	/* Save the name locally */
+	strncpy(priv->zone_name, name, THERMAL_NAME_LENGTH);
+
+	/* Then check there are no '-' or hwmon core will complain */
+	do {
+		insane_char = strpbrk(priv->zone_name, "-");
+		if (insane_char)
+			*insane_char = '_';
+	} while (insane_char);
+}
+
+/*
+ * The IP can manage to trigger interrupts on overheat situation from all the
+ * sensors. However, the interrupt source changes along with the last selected
+ * source (ie. the last read sensor), which is an inconsistent behavior. Avoid
+ * possible glitches by always selecting back only one channel (arbitrarily: the
+ * first in the DT which has a critical trip point). We also disable sensor
+ * switch during overheat situations.
+ */
+static int armada_configure_overheat_int(struct armada_thermal_priv *priv,
+					 struct thermal_zone_device *tz)
+{
+	/* Retrieve the critical trip point to enable the overheat interrupt */
+	const struct thermal_trip *trips = of_thermal_get_trip_points(tz);
+	struct armada_thermal_sensor *sensor = tz->devdata;
+	int ret;
+	int i;
+
+	if (!trips)
+		return -EINVAL;
+
+	for (i = 0; i < of_thermal_get_ntrips(tz); i++)
+		if (trips[i].type == THERMAL_TRIP_CRITICAL)
+			break;
+
+	if (i == of_thermal_get_ntrips(tz))
+		return -EINVAL;
+
+	ret = armada_select_channel(priv, sensor->id);
+	if (ret)
+		return ret;
+
+	armada_set_overheat_thresholds(priv,
+				       trips[i].temperature,
+				       trips[i].hysteresis);
+	armada_enable_overheat_interrupt(priv);
+	priv->overheat_sensor = tz;
+	priv->interrupt_source = sensor->id;
+
+	return 0;
+}
+
 static int armada_thermal_probe(struct platform_device *pdev)
 {
-	void __iomem *control = NULL;
-	struct thermal_zone_device *thermal;
+	struct thermal_zone_device *tz;
+	struct armada_thermal_sensor *sensor;
+	struct armada_drvdata *drvdata;
 	const struct of_device_id *match;
 	struct armada_thermal_priv *priv;
-	struct resource *res;
+	int sensor_id;
+	int ret;
 
 	match = of_match_device(armada_thermal_id_table, &pdev->dev);
 	if (!match)
@@ -369,58 +938,112 @@ static int armada_thermal_probe(struct platform_device *pdev)
 	if (!priv)
 		return -ENOMEM;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	priv->status = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(priv->status))
-		return PTR_ERR(priv->status);
+	drvdata = devm_kzalloc(&pdev->dev, sizeof(*drvdata), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	control = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(control))
-		return PTR_ERR(control);
-
+	priv->dev = &pdev->dev;
 	priv->data = (struct armada_thermal_data *)match->data;
+
+	mutex_init(&priv->update_lock);
 
 	/*
 	 * Legacy DT bindings only described "control1" register (also referred
-	 * as "control MSB" on old documentation). New bindings cover
+	 * as "control MSB" on old documentation). Then, bindings moved to cover
 	 * "control0/control LSB" and "control1/control MSB" registers within
-	 * the same resource, which is then of size 8 instead of 4.
+	 * the same resource, which was then of size 8 instead of 4.
+	 *
+	 * The logic of defining sporadic registers is broken. For instance, it
+	 * blocked the addition of the overheat interrupt feature that needed
+	 * another resource somewhere else in the same memory area. One solution
+	 * is to define an overall system controller and put the thermal node
+	 * into it, which requires the use of regmaps across all the driver.
 	 */
-	if (resource_size(res) == LEGACY_CONTROL_MEM_LEN) {
-		/* ->control0 unavailable in this configuration */
-		if (priv->data->needs_control0) {
-			dev_err(&pdev->dev, "No access to control0 register\n");
-			return -EINVAL;
+	if (IS_ERR(syscon_node_to_regmap(pdev->dev.parent->of_node))) {
+		/* Ensure device name is correct for the thermal core */
+		armada_set_sane_name(pdev, priv);
+
+		ret = armada_thermal_probe_legacy(pdev, priv);
+		if (ret)
+			return ret;
+
+		priv->data->init(pdev, priv);
+
+		/* Wait the sensors to be valid */
+		armada_wait_sensor_validity(priv);
+
+		tz = thermal_zone_device_register(priv->zone_name, 0, 0, priv,
+						  &legacy_ops, NULL, 0, 0);
+		if (IS_ERR(tz)) {
+			dev_err(&pdev->dev,
+				"Failed to register thermal zone device\n");
+			return PTR_ERR(tz);
 		}
 
-		priv->control1 = control + LEGACY_CONTROL1_OFFSET;
-	} else {
-		priv->control0 = control + CONTROL0_OFFSET;
-		priv->control1 = control + CONTROL1_OFFSET;
+		drvdata->type = LEGACY;
+		drvdata->data.tz = tz;
+		platform_set_drvdata(pdev, drvdata);
+
+		return 0;
 	}
 
-	priv->data->init_sensor(pdev, priv);
+	ret = armada_thermal_probe_syscon(pdev, priv);
+	if (ret)
+		return ret;
 
-	thermal = thermal_zone_device_register(dev_name(&pdev->dev), 0, 0, priv,
-					       &ops, NULL, 0, 0);
-	if (IS_ERR(thermal)) {
-		dev_err(&pdev->dev,
-			"Failed to register thermal zone device\n");
-		return PTR_ERR(thermal);
+	priv->current_channel = -1;
+	priv->data->init(pdev, priv);
+
+	/*
+	 * There is one channel for the IC and one per CPU (if any), each
+	 * channel has one sensor.
+	 */
+	for (sensor_id = 0; sensor_id <= priv->data->cpu_nr; sensor_id++) {
+		sensor = devm_kzalloc(&pdev->dev,
+				      sizeof(struct armada_thermal_sensor),
+				      GFP_KERNEL);
+		if (!sensor)
+			return -ENOMEM;
+
+		/* Register the sensor */
+		sensor->priv = priv;
+		sensor->id = sensor_id;
+		tz = devm_thermal_zone_of_sensor_register(&pdev->dev,
+							  sensor->id, sensor,
+							  &of_ops);
+		if (IS_ERR(tz)) {
+			dev_info(&pdev->dev, "Thermal sensor %d unavailable\n",
+				 sensor_id);
+			devm_kfree(&pdev->dev, sensor);
+			continue;
+		}
+
+		/*
+		 * The first channel that has a critical trip point registered
+		 * in the DT will serve as interrupt source. Others possible
+		 * critical trip points will simply be ignored by the driver.
+		 */
+		if (!priv->overheat_sensor)
+			armada_configure_overheat_int(priv, tz);
 	}
 
-	platform_set_drvdata(pdev, thermal);
+	/* Just complain if no overheat interrupt was set up */
+	if (!priv->overheat_sensor)
+		dev_warn(&pdev->dev, "Overheat interrupt feature disabled\n");
+
+	drvdata->type = SYSCON;
+	drvdata->data.priv = priv;
+	platform_set_drvdata(pdev, drvdata);
 
 	return 0;
 }
 
 static int armada_thermal_exit(struct platform_device *pdev)
 {
-	struct thermal_zone_device *armada_thermal =
-		platform_get_drvdata(pdev);
+	struct armada_drvdata *drvdata = platform_get_drvdata(pdev);
 
-	thermal_zone_device_unregister(armada_thermal);
+	if (drvdata->type == LEGACY)
+		thermal_zone_device_unregister(drvdata->data.tz);
 
 	return 0;
 }

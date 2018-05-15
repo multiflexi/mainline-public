@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
 
+#include <crypto/internal/aead.h>
 #include <crypto/internal/hash.h>
 #include <crypto/internal/skcipher.h>
 
@@ -131,18 +132,24 @@ static int eip197_load_firmwares(struct safexcel_crypto_priv *priv)
 {
 	const char *fw_name[] = {"ifpp.bin", "ipue.bin"};
 	const struct firmware *fw[FW_NB];
+	char fw_path[31];
 	int i, j, ret = 0;
 	u32 val;
 
 	for (i = 0; i < FW_NB; i++) {
-		ret = request_firmware(&fw[i], fw_name[i], priv->dev);
+		snprintf(fw_path, 31, "inside-secure/eip197b/%s", fw_name[i]);
+		ret = request_firmware(&fw[i], fw_path, priv->dev);
 		if (ret) {
-			dev_err(priv->dev,
-				"Failed to request firmware %s (%d)\n",
-				fw_name[i], ret);
-			goto release_fw;
+			/* Fallback to the old firmware location. */
+			ret = request_firmware(&fw[i], fw_name[i], priv->dev);
+			if (ret) {
+				dev_err(priv->dev,
+					"Failed to request firmware %s (%d)\n",
+					fw_name[i], ret);
+				goto release_fw;
+			}
 		}
-	 }
+	}
 
 	/* Clear the scratchpad memory */
 	val = readl(EIP197_PE(priv) + EIP197_PE_ICE_SCRATCH_CTRL);
@@ -352,6 +359,7 @@ static int safexcel_hw_init(struct safexcel_crypto_priv *priv)
 	/* H/W capabilities selection */
 	val = EIP197_FUNCTION_RSVD;
 	val |= EIP197_PROTOCOL_ENCRYPT_ONLY | EIP197_PROTOCOL_HASH_ONLY;
+	val |= EIP197_PROTOCOL_ENCRYPT_HASH | EIP197_PROTOCOL_HASH_DECRYPT;
 	val |= EIP197_ALG_AES_ECB | EIP197_ALG_AES_CBC;
 	val |= EIP197_ALG_SHA1 | EIP197_ALG_HMAC_SHA1;
 	val |= EIP197_ALG_SHA2 | EIP197_ALG_HMAC_SHA2;
@@ -767,9 +775,24 @@ static struct safexcel_alg_template *safexcel_algs[] = {
 	&safexcel_alg_sha1,
 	&safexcel_alg_sha224,
 	&safexcel_alg_sha256,
+	// FIXME: EIP197 only
+	&safexcel_alg_sha384,
+	// FIXME: EIP197 only
+	&safexcel_alg_sha512,
 	&safexcel_alg_hmac_sha1,
 	&safexcel_alg_hmac_sha224,
 	&safexcel_alg_hmac_sha256,
+	// FIXME: EIP197 only
+	&safexcel_alg_hmac_sha384,
+	// FIXME: EIP197 only
+	&safexcel_alg_hmac_sha512,
+	&safexcel_alg_authenc_hmac_sha1_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha224_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha256_cbc_aes,
+	// FIXME: EIP197 only
+	&safexcel_alg_authenc_hmac_sha384_cbc_aes,
+	// FIXME: EIP197 only
+	&safexcel_alg_authenc_hmac_sha512_cbc_aes,
 };
 
 static int safexcel_register_algorithms(struct safexcel_crypto_priv *priv)
@@ -781,6 +804,8 @@ static int safexcel_register_algorithms(struct safexcel_crypto_priv *priv)
 
 		if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
 			ret = crypto_register_skcipher(&safexcel_algs[i]->alg.skcipher);
+		else if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
+			ret = crypto_register_aead(&safexcel_algs[i]->alg.aead);
 		else
 			ret = crypto_register_ahash(&safexcel_algs[i]->alg.ahash);
 
@@ -794,6 +819,8 @@ fail:
 	for (j = 0; j < i; j++) {
 		if (safexcel_algs[j]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
 			crypto_unregister_skcipher(&safexcel_algs[j]->alg.skcipher);
+		else if (safexcel_algs[j]->type == SAFEXCEL_ALG_TYPE_AEAD)
+			crypto_unregister_aead(&safexcel_algs[j]->alg.aead);
 		else
 			crypto_unregister_ahash(&safexcel_algs[j]->alg.ahash);
 	}
@@ -808,6 +835,8 @@ static void safexcel_unregister_algorithms(struct safexcel_crypto_priv *priv)
 	for (i = 0; i < ARRAY_SIZE(safexcel_algs); i++) {
 		if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
 			crypto_unregister_skcipher(&safexcel_algs[i]->alg.skcipher);
+		else if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
+			crypto_unregister_aead(&safexcel_algs[i]->alg.aead);
 		else
 			crypto_unregister_ahash(&safexcel_algs[i]->alg.ahash);
 	}
@@ -904,7 +933,8 @@ static int safexcel_probe(struct platform_device *pdev)
 		if (ret)
 			goto err_core_clk;
 
-		ret = clk_prepare_enable(priv->reg_clk);
+// quick out-of-tree fix
+//		ret = clk_prepare_enable(priv->reg_clk);
 		if (ret) {
 			dev_err(dev, "unable to enable reg clk (%d)\n", ret);
 			goto err_core_clk;

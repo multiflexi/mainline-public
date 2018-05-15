@@ -55,6 +55,10 @@
 		compatible = "usb-nop-xceiv";
 		vcc-supply = <&cp0_reg_usb3_1_vbus>;
 	};
+
+	sfp_eth0: sfp-eth0 {
+		compatible = "sff,sfp";
+	};
 };
 
 &i2c0 {
@@ -240,8 +244,10 @@
 	status = "okay";
 	/* Network PHY */
 	phy-mode = "10gbase-kr";
+	managed = "in-band-status";
 	/* Generic PHY, providing serdes lanes */
 	phys = <&cp0_comphy2 0>;
+	sfp = <&sfp_eth0>;
 };
 
 &cp0_eth1 {

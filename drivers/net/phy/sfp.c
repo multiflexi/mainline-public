@@ -48,6 +48,7 @@ enum {
 
 	SFP_DEV_DOWN = 0,
 	SFP_DEV_UP,
+	SFP_DEV_UNKNOWN,
 
 	SFP_S_DOWN = 0,
 	SFP_S_INIT,
@@ -298,11 +299,17 @@ static void sfp_set_state(struct sfp *sfp, unsigned int state)
 
 static int sfp_read(struct sfp *sfp, bool a2, u8 addr, void *buf, size_t len)
 {
+	if (!sfp->read)
+		return -EOPNOTSUPP;
+
 	return sfp->read(sfp, a2, addr, buf, len);
 }
 
 static int sfp_write(struct sfp *sfp, bool a2, u8 addr, void *buf, size_t len)
 {
+	if (!sfp->write)
+		return -EOPNOTSUPP;
+
 	return sfp->write(sfp, a2, addr, buf, len);
 }
 
@@ -533,6 +540,8 @@ static int sfp_sm_mod_hpower(struct sfp *sfp)
 		return 0;
 
 	err = sfp_read(sfp, true, SFP_EXT_STATUS, &val, sizeof(val));
+	if (err == -EOPNOTSUPP)
+		goto err;
 	if (err != sizeof(val)) {
 		dev_err(sfp->dev, "Failed to read EEPROM: %d\n", err);
 		err = -EAGAIN;
@@ -542,6 +551,8 @@ static int sfp_sm_mod_hpower(struct sfp *sfp)
 	val |= BIT(0);
 
 	err = sfp_write(sfp, true, SFP_EXT_STATUS, &val, sizeof(val));
+	if (err == -EOPNOTSUPP)
+		goto err;
 	if (err != sizeof(val)) {
 		dev_err(sfp->dev, "Failed to write EEPROM: %d\n", err);
 		err = -EAGAIN;
@@ -565,6 +576,8 @@ static int sfp_sm_mod_probe(struct sfp *sfp)
 	int ret;
 
 	ret = sfp_read(sfp, false, 0, &id, sizeof(id));
+	if (ret == -EOPNOTSUPP)
+		return ret;
 	if (ret < 0) {
 		dev_err(sfp->dev, "failed to read EEPROM: %d\n", ret);
 		return -EAGAIN;
@@ -724,6 +737,15 @@ static void sfp_sm_event(struct sfp *sfp, unsigned int event)
 				sfp_module_tx_disable(sfp);
 			sfp->sm_dev_state = SFP_DEV_DOWN;
 		}
+		break;
+
+	case SFP_DEV_UNKNOWN:
+		/* We can't know the state of the SFP link. Report the
+		 * link as being up as its status has to be guessed by
+		 * other layers.
+		 */
+		if (event != SFP_E_DEV_UP)
+			sfp_link_up(sfp->sfp_bus);
 		break;
 	}
 
@@ -1064,6 +1086,21 @@ static int sfp_probe(struct platform_device *pdev)
 
 	if (poll)
 		mod_delayed_work(system_wq, &sfp->poll, poll_jiffies);
+
+	/* We won't be able to know the state of the SFP link, report it as
+	 * unknown.
+	 */
+	if (!sfp->gpio[GPIO_MODDEF0] && !sfp->gpio[GPIO_LOS])
+		sfp->sm_dev_state = SFP_DEV_UNKNOWN;
+
+	/* We could have an issue in cases no Tx disable pin is available or
+	 * wired as modules using a laser as their light source will continue to
+	 * be active when the fiber is removed. This could be a safety issue and
+	 * we should at least warn the user about that.
+	 */
+	if (!sfp->gpio[GPIO_TX_DISABLE])
+		dev_warn(sfp->dev,
+			 "No tx_disable pin: SFP modules will always be emitting.\n");
 
 	return 0;
 }
