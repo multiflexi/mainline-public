@@ -288,7 +288,7 @@ static int safexcel_hw_init(struct safexcel_crypto_priv *priv)
 	writel(EIP197_DxE_THR_CTRL_RESET_PE,
 	       EIP197_HIA_DFE_THR(priv) + EIP197_HIA_DFE_THR_CTRL);
 
-	if (priv->version == EIP197) {
+	if (priv->data->version == EIP197) {
 		/* Reset HIA input interface arbiter */
 		writel(EIP197_HIA_RA_PE_CTRL_RESET,
 		       EIP197_HIA_AIC(priv) + EIP197_HIA_RA_PE_CTRL);
@@ -311,7 +311,7 @@ static int safexcel_hw_init(struct safexcel_crypto_priv *priv)
 	writel(EIP197_PE_IN_xBUF_THRES_MIN(5) | EIP197_PE_IN_xBUF_THRES_MAX(7),
 	       EIP197_PE(priv) + EIP197_PE_IN_TBUF_THRES);
 
-	if (priv->version == EIP197) {
+	if (priv->data->version == EIP197) {
 		/* enable HIA input interface arbiter and rings */
 		writel(EIP197_HIA_RA_PE_CTRL_EN |
 		       GENMASK(priv->config.rings - 1, 0),
@@ -337,7 +337,7 @@ static int safexcel_hw_init(struct safexcel_crypto_priv *priv)
 	/* FIXME: instability issues can occur for EIP97 but disabling it impact
 	 * performances.
 	 */
-	if (priv->version == EIP197)
+	if (priv->data->version == EIP197)
 		val |= EIP197_HIA_DSE_CFG_EN_SINGLE_WR;
 	writel(val, EIP197_HIA_DSE(priv) + EIP197_HIA_DSE_CFG);
 
@@ -419,7 +419,7 @@ static int safexcel_hw_init(struct safexcel_crypto_priv *priv)
 	/* Clear any HIA interrupt */
 	writel(GENMASK(30, 20), EIP197_HIA_AIC_G(priv) + EIP197_HIA_AIC_G_ACK);
 
-	if (priv->version == EIP197) {
+	if (priv->data->version == EIP197) {
 		eip197_trc_cache_init(priv);
 
 		ret = eip197_load_firmwares(priv);
@@ -784,33 +784,20 @@ static int safexcel_request_ring_irq(struct platform_device *pdev, const char *n
 	return irq;
 }
 
-static struct safexcel_alg_template *safexcel_algs[] = {
-	&safexcel_alg_ecb_aes,
-	&safexcel_alg_cbc_aes,
-	&safexcel_alg_sha1,
-	&safexcel_alg_sha224,
-	&safexcel_alg_sha256,
-	&safexcel_alg_hmac_sha1,
-	&safexcel_alg_hmac_sha224,
-	&safexcel_alg_hmac_sha256,
-	&safexcel_alg_authenc_hmac_sha1_cbc_aes,
-	&safexcel_alg_authenc_hmac_sha224_cbc_aes,
-	&safexcel_alg_authenc_hmac_sha256_cbc_aes,
-};
-
 static int safexcel_register_algorithms(struct safexcel_crypto_priv *priv)
 {
+	struct safexcel_alg_template **algs = priv->data->algs;
 	int i, j, ret = 0;
 
-	for (i = 0; i < ARRAY_SIZE(safexcel_algs); i++) {
-		safexcel_algs[i]->priv = priv;
+	for (i = 0; i < priv->data->nalgs; i++) {
+		algs[i]->priv = priv;
 
-		if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
-			ret = crypto_register_skcipher(&safexcel_algs[i]->alg.skcipher);
-		else if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
-			ret = crypto_register_aead(&safexcel_algs[i]->alg.aead);
+		if (algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
+			ret = crypto_register_skcipher(&algs[i]->alg.skcipher);
+		else if (algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
+			ret = crypto_register_aead(&algs[i]->alg.aead);
 		else
-			ret = crypto_register_ahash(&safexcel_algs[i]->alg.ahash);
+			ret = crypto_register_ahash(&algs[i]->alg.ahash);
 
 		if (ret)
 			goto fail;
@@ -820,12 +807,12 @@ static int safexcel_register_algorithms(struct safexcel_crypto_priv *priv)
 
 fail:
 	for (j = 0; j < i; j++) {
-		if (safexcel_algs[j]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
-			crypto_unregister_skcipher(&safexcel_algs[j]->alg.skcipher);
-		else if (safexcel_algs[j]->type == SAFEXCEL_ALG_TYPE_AEAD)
-			crypto_unregister_aead(&safexcel_algs[j]->alg.aead);
+		if (algs[j]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
+			crypto_unregister_skcipher(&algs[j]->alg.skcipher);
+		else if (algs[j]->type == SAFEXCEL_ALG_TYPE_AEAD)
+			crypto_unregister_aead(&algs[j]->alg.aead);
 		else
-			crypto_unregister_ahash(&safexcel_algs[j]->alg.ahash);
+			crypto_unregister_ahash(&algs[j]->alg.ahash);
 	}
 
 	return ret;
@@ -833,15 +820,16 @@ fail:
 
 static void safexcel_unregister_algorithms(struct safexcel_crypto_priv *priv)
 {
+	struct safexcel_alg_template **algs = priv->data->algs;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(safexcel_algs); i++) {
-		if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
-			crypto_unregister_skcipher(&safexcel_algs[i]->alg.skcipher);
-		else if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
-			crypto_unregister_aead(&safexcel_algs[i]->alg.aead);
+	for (i = 0; i < priv->data->nalgs; i++) {
+		if (algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
+			crypto_unregister_skcipher(&algs[i]->alg.skcipher);
+		else if (algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
+			crypto_unregister_aead(&algs[i]->alg.aead);
 		else
-			crypto_unregister_ahash(&safexcel_algs[i]->alg.ahash);
+			crypto_unregister_ahash(&algs[i]->alg.ahash);
 	}
 }
 
@@ -867,7 +855,7 @@ static void safexcel_init_register_offsets(struct safexcel_crypto_priv *priv)
 {
 	struct safexcel_register_offsets *offsets = &priv->offsets;
 
-	if (priv->version == EIP197) {
+	if (priv->data->version == EIP197) {
 		offsets->hia_aic	= EIP197_HIA_AIC_BASE;
 		offsets->hia_aic_g	= EIP197_HIA_AIC_G_BASE;
 		offsets->hia_aic_r	= EIP197_HIA_AIC_R_BASE;
@@ -904,7 +892,7 @@ static int safexcel_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	priv->dev = dev;
-	priv->version = (enum safexcel_eip_version)of_device_get_match_data(dev);
+	priv->data = (struct safexcel_data *)of_device_get_match_data(dev);
 
 	safexcel_init_register_offsets(priv);
 
@@ -1049,14 +1037,54 @@ static int safexcel_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static struct safexcel_alg_template *safexcel_eip97_algs[] = {
+	&safexcel_alg_ecb_aes,
+	&safexcel_alg_cbc_aes,
+	&safexcel_alg_sha1,
+	&safexcel_alg_sha224,
+	&safexcel_alg_sha256,
+	&safexcel_alg_hmac_sha1,
+	&safexcel_alg_hmac_sha224,
+	&safexcel_alg_hmac_sha256,
+	&safexcel_alg_authenc_hmac_sha1_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha224_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha256_cbc_aes,
+};
+
+static const struct safexcel_data eip97_data = {
+	.version = EIP97,
+	.algs = safexcel_eip97_algs,
+	.nalgs = ARRAY_SIZE(safexcel_eip97_algs),
+};
+
+static struct safexcel_alg_template *safexcel_eip197_algs[] = {
+	&safexcel_alg_ecb_aes,
+	&safexcel_alg_cbc_aes,
+	&safexcel_alg_sha1,
+	&safexcel_alg_sha224,
+	&safexcel_alg_sha256,
+	&safexcel_alg_hmac_sha1,
+	&safexcel_alg_hmac_sha224,
+	&safexcel_alg_hmac_sha256,
+	&safexcel_alg_authenc_hmac_sha1_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha224_cbc_aes,
+	&safexcel_alg_authenc_hmac_sha256_cbc_aes,
+};
+
+static const struct safexcel_data eip197_data = {
+	.version = EIP197,
+	.algs = safexcel_eip197_algs,
+	.nalgs = ARRAY_SIZE(safexcel_eip197_algs),
+};
+
 static const struct of_device_id safexcel_of_match_table[] = {
 	{
 		.compatible = "inside-secure,safexcel-eip97",
-		.data = (void *)EIP97,
+		.data = &eip97_data,
 	},
 	{
 		.compatible = "inside-secure,safexcel-eip197",
-		.data = (void *)EIP197,
+		.data = &eip197_data,
 	},
 	{},
 };

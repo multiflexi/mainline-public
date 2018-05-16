@@ -531,6 +531,12 @@ enum safexcel_eip_version {
 	EIP197,
 };
 
+struct safexcel_data {
+	enum safexcel_eip_version version;
+	struct safexcel_alg_template **algs;
+	int nalgs;
+};
+
 struct safexcel_register_offsets {
 	u32 hia_aic;
 	u32 hia_aic_g;
@@ -551,7 +557,7 @@ struct safexcel_crypto_priv {
 	struct clk *reg_clk;
 	struct safexcel_config config;
 
-	enum safexcel_eip_version version;
+	struct safexcel_data *data;
 	struct safexcel_register_offsets offsets;
 
 	/* context DMA pool */

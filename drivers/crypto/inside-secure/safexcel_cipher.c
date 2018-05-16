@@ -145,7 +145,7 @@ static int safexcel_skcipher_aes_setkey(struct crypto_skcipher *ctfm,
 		return ret;
 	}
 
-	if (priv->version == EIP197 && ctx->base.ctxr_dma) {
+	if (priv->data->version == EIP197 && ctx->base.ctxr_dma) {
 		for (i = 0; i < len / sizeof(u32); i++) {
 			if (ctx->key[i] != cpu_to_le32(aes.key_enc[i])) {
 				ctx->base.needs_inv = true;
@@ -179,7 +179,7 @@ static int safexcel_aead_aes_setkey(struct crypto_aead *ctfm, const u8 *key,
 		goto badkey;
 
 	/* Encryption key */
-	if (priv->version == EIP197 && ctx->base.ctxr_dma &&
+	if (priv->data->version == EIP197 && ctx->base.ctxr_dma &&
 	    memcmp(ctx->key, keys.enckey, keys.enckeylen))
 		ctx->base.needs_inv = true;
 
@@ -208,7 +208,7 @@ static int safexcel_aead_aes_setkey(struct crypto_aead *ctfm, const u8 *key,
 	crypto_aead_set_flags(ctfm, crypto_aead_get_flags(ctfm) &
 				    CRYPTO_TFM_RES_MASK);
 
-	if (priv->version == EIP197 && ctx->base.ctxr_dma &&
+	if (priv->data->version == EIP197 && ctx->base.ctxr_dma &&
 	    (memcmp(ctx->ipad, istate.state, ctx->state_sz) ||
 	     memcmp(ctx->opad, ostate.state, ctx->state_sz)))
 		ctx->base.needs_inv = true;
@@ -602,7 +602,7 @@ static int safexcel_skcipher_send(struct crypto_async_request *async, int ring,
 	struct safexcel_crypto_priv *priv = ctx->priv;
 	int ret;
 
-	BUG_ON(priv->version == EIP97 && sreq->needs_inv);
+	BUG_ON(priv->data->version == EIP97 && sreq->needs_inv);
 
 	if (sreq->needs_inv)
 		ret = safexcel_cipher_send_inv(async, ring, request, commands,
@@ -625,7 +625,7 @@ static int safexcel_aead_send(struct crypto_async_request *async, int ring,
 	struct safexcel_crypto_priv *priv = ctx->priv;
 	int ret;
 
-	BUG_ON(priv->version == EIP97 && sreq->needs_inv);
+	BUG_ON(priv->data->version == EIP97 && sreq->needs_inv);
 
 	if (sreq->needs_inv)
 		ret = safexcel_cipher_send_inv(async, ring, request, commands,
@@ -715,7 +715,7 @@ static int safexcel_aes(struct crypto_async_request *base,
 	ctx->mode = mode;
 
 	if (ctx->base.ctxr) {
-		if (priv->version == EIP197 && ctx->base.needs_inv) {
+		if (priv->data->version == EIP197 && ctx->base.needs_inv) {
 			sreq->needs_inv = true;
 			ctx->base.needs_inv = false;
 		}
@@ -792,7 +792,7 @@ static void safexcel_skcipher_cra_exit(struct crypto_tfm *tfm)
 	if (safexcel_cipher_cra_exit(tfm))
 		return;
 
-	if (priv->version == EIP197) {
+	if (priv->data->version == EIP197) {
 		ret = safexcel_skcipher_exit_inv(tfm);
 		if (ret)
 			dev_warn(priv->dev, "skcipher: invalidation error %d\n",
@@ -812,7 +812,7 @@ static void safexcel_aead_cra_exit(struct crypto_tfm *tfm)
 	if (safexcel_cipher_cra_exit(tfm))
 		return;
 
-	if (priv->version == EIP197) {
+	if (priv->data->version == EIP197) {
 		ret = safexcel_aead_exit_inv(tfm);
 		if (ret)
 			dev_warn(priv->dev, "aead: invalidation error %d\n",
