@@ -879,7 +879,7 @@ enum mvpp2_prs_l3_cast {
 #define MVPP21_ADDR_SPACE_SZ		0
 #define MVPP22_ADDR_SPACE_SZ		SZ_64K
 
-#define MVPP2_MAX_THREADS		8
+#define MVPP2_MAX_THREADS		9
 #define MVPP2_MAX_QVECS			MVPP2_MAX_THREADS
 
 enum mvpp2_bm_pool_log_num {
