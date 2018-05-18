@@ -5181,6 +5181,15 @@ static void mvpp2_gather_hw_statistics(struct work_struct *work)
 	mutex_unlock(&port->gather_stats_lock);
 }
 
+static void mvpp2_stats_clear_all(struct mvpp2_port *port)
+{
+	unsigned int i;
+
+	/* Read the GOP statistics to reset the hardware counters */
+	for (i = 0; i < ARRAY_SIZE(mvpp2_ethtool_regs); i++)
+		mvpp2_read_count(port, &mvpp2_ethtool_regs[i]);
+}
+
 static void mvpp2_ethtool_get_stats(struct net_device *dev,
 				    struct ethtool_stats *stats, u64 *data)
 {
@@ -5208,11 +5217,8 @@ static int mvpp2_ethtool_get_sset_count(struct net_device *dev, int sset)
 static void mvpp2_port_reset(struct mvpp2_port *port)
 {
 	u32 val;
-	unsigned int i;
 
-	/* Read the GOP statistics to reset the hardware counters */
-	for (i = 0; i < ARRAY_SIZE(mvpp2_ethtool_regs); i++)
-		mvpp2_read_count(port, &mvpp2_ethtool_regs[i]);
+	mvpp2_stats_clear_all(port);
 
 	val = readl(port->base + MVPP2_GMAC_CTRL_2_REG) &
 		    ~MVPP2_GMAC_PORT_RESET_MASK;
