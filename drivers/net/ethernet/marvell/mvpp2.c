@@ -4177,6 +4177,16 @@ static void mvpp2_cls_flow_write(struct mvpp2 *priv,
 	mvpp2_write(priv, MVPP2_CLS_FLOW_TBL2_REG,  fe->data[2]);
 }
 
+static void mvpp2_cls_flow_read(struct mvpp2 *priv, int index,
+				struct mvpp2_cls_flow_entry *fe)
+{
+	fe->index = index;
+	mvpp2_write(priv, MVPP2_CLS_FLOW_INDEX_REG, index);
+	fe->data[0] = mvpp2_read(priv, MVPP2_CLS_FLOW_TBL0_REG);
+	fe->data[1] = mvpp2_read(priv, MVPP2_CLS_FLOW_TBL1_REG);
+	fe->data[2] = mvpp2_read(priv, MVPP2_CLS_FLOW_TBL2_REG);
+}
+
 static void mvpp2_cls_lookup_read(struct mvpp2 *priv, int lkpid, int way,
 				  struct mvpp2_cls_lookup_entry *le)
 {
@@ -4207,6 +4217,18 @@ static void mvpp2_cls_sw_flow_hek_num_set(struct mvpp2_cls_flow_entry *fe,
 {
 	fe->data[1] &= ~MVPP2_CLS_FLOW_TBL1_N_FIELDS_MASK;
 	fe->data[1] |= MVPP2_CLS_FLOW_TBL1_N_FIELDS(num_of_fields);
+}
+
+static int mvpp2_cls_sw_flow_hek_num_get(struct mvpp2_cls_flow_entry *fe)
+{
+	return fe->data[1] & MVPP2_CLS_FLOW_TBL1_N_FIELDS_MASK;
+}
+
+static int mvpp2_cls_sw_flow_hek_get(struct mvpp2_cls_flow_entry *fe,
+				     int field_index)
+{
+	return (fe->data[2] >> MVPP2_CLS_FLOW_TBL2_FLD_OFFS(field_index)) &
+		MVPP2_CLS_FLOW_TBL2_FLD_MASK;
 }
 
 static void mvpp2_cls_sw_flow_hek_set(struct mvpp2_cls_flow_entry *fe,
@@ -7416,6 +7438,146 @@ static void mvpp2_init_cls_c2(struct mvpp2 *priv)
 	mvpp2_write(priv, MVPP22_CLS_C2_ATTR2, MVPP22_CLS_C2_ATTR2_RSS_EN);
 }
 
+static int mvpp2_flow_add_hek_field(struct mvpp2_cls_flow_entry *fe,
+				    u32 field_id)
+{
+	int nb_fields = mvpp2_cls_sw_flow_hek_num_get(fe);
+
+	if (nb_fields == MVPP2_FLOW_N_FIELDS)
+		return -EINVAL;
+
+	mvpp2_cls_sw_flow_hek_set(fe, nb_fields, field_id);
+
+	mvpp2_cls_sw_flow_hek_num_set(fe, nb_fields + 1);
+
+	return 0;
+}
+
+/* Add HEK fields to the flow command */
+static int mvpp2_rss_hash_opts_set(struct mvpp2_cls_flow_entry *fe, u32 cmd,
+				   int proto)
+{
+	/* It's a requirement to add HEK fields to the flow in ascending
+	 * field_id order
+	 */
+	if (cmd & RXH_VLAN)
+		if (mvpp2_flow_add_hek_field(fe, MVPP22_CLS_FIELD_VLAN))
+			return -EINVAL;
+
+	if (proto == RSS_IP4) {
+		if (cmd & RXH_IP_SRC)
+			if (mvpp2_flow_add_hek_field(fe,
+						     MVPP22_CLS_FIELD_IP4SA))
+				return -EINVAL;
+
+		if (cmd & RXH_IP_DST)
+			if (mvpp2_flow_add_hek_field(fe,
+						     MVPP22_CLS_FIELD_IP4DA))
+				return -EINVAL;
+	} else {
+		if (cmd & RXH_IP_SRC)
+			if (mvpp2_flow_add_hek_field(fe,
+						     MVPP22_CLS_FIELD_IP6SA))
+				return -EINVAL;
+
+		if (cmd & RXH_IP_DST)
+			if (mvpp2_flow_add_hek_field(fe,
+						     MVPP22_CLS_FIELD_IP6DA))
+				return -EINVAL;
+	}
+
+	if (cmd & RXH_L4_B_0_1)
+		if (mvpp2_flow_add_hek_field(fe, MVPP22_CLS_FIELD_L4SIP))
+			return -EINVAL;
+
+	if (cmd & RXH_L4_B_2_3)
+		if (mvpp2_flow_add_hek_field(fe, MVPP22_CLS_FIELD_L4DIP))
+			return -EINVAL;
+	return 0;
+}
+
+static int mvpp2_rss_set_flow(struct mvpp2_port *port,
+			      struct ethtool_rxnfc *info)
+{
+	int ret = 0, engine = MVPP22_CLS_ENGINE_C3HB;
+	int flow_id = MVPP22_RSS_FLOW_HASH(port->id);
+	struct mvpp2_cls_flow_entry fe;
+
+	mvpp2_cls_flow_read(port->priv, flow_id, &fe);
+
+	/* Clear former HEK parameters */
+	mvpp2_cls_sw_flow_hek_num_set(&fe, 0);
+	fe.data[2] = 0;
+
+	switch (info->flow_type) {
+	case IPV4_FLOW:
+		/* When L4 data isn't needed, we use C3HA engine. C3HB engine
+		 * automatically adds the L4 info field to the hash.
+		 * The L4 info field comes from the Header Parser.
+		 */
+		engine = MVPP22_CLS_ENGINE_C3HA;
+	case TCP_V4_FLOW:
+	case UDP_V4_FLOW:
+		ret = mvpp2_rss_hash_opts_set(&fe, info->data, RSS_IP4);
+		break;
+	case IPV6_FLOW:
+		engine = MVPP22_CLS_ENGINE_C3HA;
+	case TCP_V6_FLOW:
+	case UDP_V6_FLOW:
+		ret = mvpp2_rss_hash_opts_set(&fe, info->data, RSS_IP6);
+		break;
+	default: return -EOPNOTSUPP;
+	}
+
+	mvpp2_cls_sw_flow_eng_set(&fe, engine);
+
+	mvpp2_cls_flow_write(port->priv, &fe);
+
+	return ret;
+}
+
+static int mvpp2_rss_get_flow(struct mvpp2_port *port,
+			      struct ethtool_rxnfc *info)
+{
+	int n_fields, field, flow_id, i;
+	struct mvpp2_cls_flow_entry fe;
+
+	flow_id = MVPP22_RSS_FLOW_HASH(port->id);
+
+	mvpp2_cls_flow_read(port->priv, flow_id, &fe);
+
+	n_fields = mvpp2_cls_sw_flow_hek_num_get(&fe);
+	info->data = 0;
+
+	for (i = 0; i < n_fields; i++) {
+		field = mvpp2_cls_sw_flow_hek_get(&fe, i);
+
+		switch (field) {
+		case MVPP22_CLS_FIELD_VLAN:
+			info->data |= RXH_VLAN;
+			break;
+		case MVPP22_CLS_FIELD_IP4SA:
+		case MVPP22_CLS_FIELD_IP6SA:
+			info->data |= RXH_IP_SRC;
+			break;
+		case MVPP22_CLS_FIELD_IP6DA:
+		case MVPP22_CLS_FIELD_IP4DA:
+			info->data |= RXH_IP_DST;
+			break;
+		case MVPP22_CLS_FIELD_L4SIP:
+			info->data |= RXH_L4_B_0_1;
+			break;
+		case MVPP22_CLS_FIELD_L4DIP:
+			info->data |= RXH_L4_B_2_3;
+			break;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 /* Lookup in RSS Table works this way :
  *
  * The first 8 bits of the hash is used to perform a lookup in a 256-entries
@@ -8068,11 +8230,15 @@ static int mvpp2_ethtool_get_rxnfc(struct net_device *dev,
 				   struct ethtool_rxnfc *info, u32 *rules)
 {
 	struct mvpp2_port *port = netdev_priv(dev);
+	int ret = 0;
 
 	if (!mvpp22_rss_is_supported())
 		return -EOPNOTSUPP;
 
 	switch (info->cmd) {
+	case ETHTOOL_GRXFH:
+		ret = mvpp2_rss_get_flow(port, info);
+		break;
 	case ETHTOOL_GRXRINGS:
 		info->data = port->nrxqs;
 		break;
@@ -8080,7 +8246,26 @@ static int mvpp2_ethtool_get_rxnfc(struct net_device *dev,
 		return -ENOTSUPP;
 	}
 
-	return 0;
+	return ret;
+}
+
+static int mvpp2_ethtool_set_rxnfc(struct net_device *dev,
+				   struct ethtool_rxnfc *info)
+{
+	struct mvpp2_port *port = netdev_priv(dev);
+	int ret = 0;
+
+	if (!mvpp22_rss_is_supported())
+		return -EOPNOTSUPP;
+
+	switch (info->cmd) {
+	case ETHTOOL_SRXFH:
+		ret = mvpp2_rss_set_flow(port, info);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	return ret;
 }
 
 static u32 mvpp2_ethtool_get_rxfh_indir_size(struct net_device *dev)
@@ -8161,6 +8346,7 @@ static const struct ethtool_ops mvpp2_eth_tool_ops = {
 	.get_link_ksettings	= mvpp2_ethtool_get_link_ksettings,
 	.set_link_ksettings	= mvpp2_ethtool_set_link_ksettings,
 	.get_rxnfc		= mvpp2_ethtool_get_rxnfc,
+	.set_rxnfc		= mvpp2_ethtool_set_rxnfc,
 	.get_rxfh_indir_size	= mvpp2_ethtool_get_rxfh_indir_size,
 	.get_rxfh		= mvpp2_ethtool_get_rxfh,
 	.set_rxfh		= mvpp2_ethtool_set_rxfh,
