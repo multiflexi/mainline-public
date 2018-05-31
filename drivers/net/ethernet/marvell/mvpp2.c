@@ -95,9 +95,9 @@
 #define     MVPP22_RSS_INDEX_TABLE_ENTRY(idx)	(idx)
 #define     MVPP22_RSS_INDEX_TABLE(idx)		((idx) << 8)
 #define     MVPP22_RSS_INDEX_QUEUE(idx)		((idx) << 16)
-#define MVPP22_RSS_TABLE_ENTRY			0x1508
-#define MVPP22_RSS_TABLE			0x1510
+#define MVPP22_RXQ2RSS_TABLE			0x1504
 #define     MVPP22_RSS_TABLE_POINTER(p)		(p)
+#define MVPP22_RSS_TABLE_ENTRY			0x1508
 #define MVPP22_RSS_WIDTH			0x150c
 
 /* Classifier Registers */
@@ -7139,7 +7139,7 @@ static void mvpp22_init_rss(struct mvpp2_port *port)
 	 */
 	for (i = 0; i < MVPP2_CLS_RX_QUEUES; i++) {
 		mvpp2_write(priv, MVPP22_RSS_INDEX, MVPP22_RSS_INDEX_QUEUE(i));
-		mvpp2_write(priv, MVPP22_RSS_TABLE,
+		mvpp2_write(priv, MVPP22_RXQ2RSS_TABLE,
 			    MVPP22_RSS_TABLE_POINTER(0));
 	}
 
